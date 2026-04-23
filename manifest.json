@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "Moodle-fucker",
+  "version": "1.0",
+  "description": "Moodleのクイズ問題を検出してcapi.voids.topのAI APIで回答候補を表示します",
+  "permissions": ["activeTab", "scripting"],
+  "host_permissions": ["https://capi.voids.top/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [ "http://*/mod/quiz/attempt.php*", "https://*/mod/quiz/attempt.php*" ],
+      "js": ["content.js"]
+    }
+  ],
+  "icons": {
+    "48": "icon.png"
+  }
+}
