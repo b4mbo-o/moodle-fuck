@@ -22,11 +22,86 @@ const runtimeState = {
   queueCount: 0,
 };
 
+const DEFAULT_SETTINGS = {
+  enabled: true,
+  pausedUntil: 0,
+  detailedMode: false,
+  showStatusWidget: true,
+};
+
+let currentSettings = { ...DEFAULT_SETTINGS };
+let settingsLoaded = false;
+
 function normalizeText(value) {
   return (value || "")
     .replace(/\u00a0/g, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function normalizeSettings(raw = {}) {
+  return {
+    enabled: raw.enabled !== false,
+    pausedUntil: Number(raw.pausedUntil) || 0,
+    detailedMode: Boolean(raw.detailedMode),
+    showStatusWidget: raw.showStatusWidget !== false,
+  };
+}
+
+function getRequestCacheKey(question, settings = currentSettings) {
+  return JSON.stringify({
+    questionKey: question.key,
+    detailedMode: Boolean(settings.detailedMode),
+  });
+}
+
+function isPaused(settings = currentSettings) {
+  return !settings.enabled || settings.pausedUntil > Date.now();
+}
+
+function formatPausedUntil(timestamp) {
+  return new Intl.DateTimeFormat("ja-JP", {
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(timestamp));
+}
+
+function getPausedMessage(settings = currentSettings) {
+  if (!settings.enabled) {
+    return "Popupから停止中です。";
+  }
+
+  if (settings.pausedUntil > Date.now()) {
+    return `${formatPausedUntil(settings.pausedUntil)} まで一時停止中です。`;
+  }
+
+  return "";
+}
+
+function syncStatusWidgetVisibility() {
+  const widget = document.getElementById(STATUS_WIDGET_ID);
+  if (!widget) {
+    return;
+  }
+
+  widget.style.display = currentSettings.showStatusWidget ? "" : "none";
+}
+
+function loadSettings(force = false) {
+  if (settingsLoaded && !force) {
+    return Promise.resolve(currentSettings);
+  }
+
+  return new Promise((resolve) => {
+    chrome.storage.local.get(DEFAULT_SETTINGS, (items) => {
+      currentSettings = normalizeSettings(items);
+      settingsLoaded = true;
+      syncStatusWidgetVisibility();
+      resolve(currentSettings);
+    });
+  });
 }
 
 function renderNodeText(node, options = {}) {
@@ -294,6 +369,7 @@ function buildQuestionKey(questionText, options, uniqueId = "") {
 function ensureStatusWidget() {
   let widget = document.getElementById(STATUS_WIDGET_ID);
   if (widget) {
+    syncStatusWidgetVisibility();
     return widget;
   }
 
@@ -302,7 +378,7 @@ function ensureStatusWidget() {
   widget.dataset.phase = "booting";
   widget.innerHTML = `
     <div class="moodle-status-title">
-      <span>Moodle Hint</span>
+      <span>MoodleFuck</span>
       <span class="moodle-status-pill">Booting</span>
     </div>
     <div class="moodle-status-message">Content script started.</div>
@@ -310,6 +386,7 @@ function ensureStatusWidget() {
   `;
 
   (document.body || document.documentElement).appendChild(widget);
+  syncStatusWidgetVisibility();
   return widget;
 }
 
@@ -767,6 +844,39 @@ function updatePanel(panel, payload) {
   panel.querySelector(".moodle-hint-meta").textContent = payload.meta || "";
 }
 
+function clearQueuedTasks() {
+  taskQueue.length = 0;
+  runtimeState.queueCount = activeRequests;
+}
+
+function resetPanelLoadState({ clearLoaded = false } = {}) {
+  for (const panel of Array.from(document.querySelectorAll(`.${HINT_PANEL_CLASS}`))) {
+    delete panel.dataset.loadingKey;
+
+    if (clearLoaded) {
+      delete panel.dataset.loadedKey;
+    }
+  }
+}
+
+function markLoadingPanelsPaused(message) {
+  const pausedMessage = message || "Paused.";
+
+  for (const panel of Array.from(document.querySelectorAll(`.${HINT_PANEL_CLASS}`))) {
+    if (panel.dataset.state !== "loading") {
+      continue;
+    }
+
+    updatePanel(panel, {
+      state: "idle",
+      status: "Paused",
+      answer: pausedMessage,
+      reason: "",
+      meta: "",
+    });
+  }
+}
+
 function getPanelStats() {
   const panels = Array.from(document.querySelectorAll(`.${HINT_PANEL_CLASS}`));
 
@@ -788,7 +898,15 @@ function getPanelStats() {
   );
 }
 
-function parseAnswerText(answerText) {
+function parseAnswerText(answerPayload) {
+  const answerText =
+    typeof answerPayload === "string"
+      ? answerPayload
+      : answerPayload?.answer || "";
+  const modelName = normalizeText(
+    typeof answerPayload === "object" ? answerPayload?.model || "" : ""
+  );
+
   const answer = String(answerText || "")
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -798,17 +916,19 @@ function parseAnswerText(answerText) {
     return {
       answer: "No hint available.",
       reason: "",
+      meta: "",
     };
   }
 
   return {
     answer,
     reason: "",
+    meta: modelName ? `Model: ${modelName}` : "",
   };
 }
 
 function requestAnswer(question) {
-  const cacheKey = question.key;
+  const cacheKey = getRequestCacheKey(question);
 
   if (answerCache.has(cacheKey)) {
     return Promise.resolve(answerCache.get(cacheKey));
@@ -827,11 +947,18 @@ function requestAnswer(question) {
         requestKey: question.requestKey || question.key,
         targetType: question.targetType || "standard",
         fieldLabel: question.fieldLabel || "",
+        detailedMode: Boolean(currentSettings.detailedMode),
       },
       (response) => {
         const runtimeError = chrome.runtime.lastError;
         if (runtimeError) {
           reject(new Error(runtimeError.message));
+          return;
+        }
+
+        const responseError = normalizeText(response?.error || "");
+        if (responseError) {
+          reject(new Error(responseError));
           return;
         }
 
@@ -841,8 +968,13 @@ function requestAnswer(question) {
           return;
         }
 
-        answerCache.set(cacheKey, answer);
-        resolve(answer);
+        const result = {
+          answer,
+          model: normalizeText(response?.model || ""),
+        };
+
+        answerCache.set(cacheKey, result);
+        resolve(result);
       }
     );
   }).finally(() => {
@@ -862,6 +994,10 @@ function enqueue(task) {
 }
 
 function runQueue() {
+  if (isPaused(currentSettings)) {
+    return;
+  }
+
   while (activeRequests < MAX_CONCURRENT_REQUESTS && taskQueue.length) {
     const task = taskQueue.shift();
     activeRequests += 1;
@@ -874,9 +1010,15 @@ function runQueue() {
       .finally(() => {
         activeRequests -= 1;
         if (taskQueue.length + activeRequests > 0) {
-          setStatus("running", "Preparing hints...", {
-            queueCount: taskQueue.length + activeRequests,
-          });
+          if (isPaused(currentSettings)) {
+            setStatus("idle", getPausedMessage(currentSettings), {
+              queueCount: activeRequests,
+            });
+          } else {
+            setStatus("running", "Preparing hints...", {
+              queueCount: taskQueue.length + activeRequests,
+            });
+          }
         }
         runQueue();
       });
@@ -884,15 +1026,22 @@ function runQueue() {
 }
 
 async function hydratePanel(question, panel) {
+  const settings = await loadSettings();
+  const loadKey = getRequestCacheKey(question, settings);
+
   if (
-    panel.dataset.loadedKey === question.key ||
-    panel.dataset.loadingKey === question.key
+    panel.dataset.loadedKey === loadKey ||
+    panel.dataset.loadingKey === loadKey
   ) {
     return;
   }
 
+  if (isPaused(settings)) {
+    return;
+  }
+
   try {
-    panel.dataset.loadingKey = question.key;
+    panel.dataset.loadingKey = loadKey;
     setStatus("running", `${question.label}: generating hint...`, {
       queueCount: taskQueue.length + activeRequests,
     });
@@ -904,22 +1053,24 @@ async function hydratePanel(question, panel) {
       meta: "",
     });
 
-    const answerText = await requestAnswer(question);
-    const parsed = parseAnswerText(answerText);
+    const answerResult = await requestAnswer(question);
+    const parsed = parseAnswerText(answerResult);
 
-    panel.dataset.loadedKey = question.key;
+    panel.dataset.loadedKey = loadKey;
     runtimeState.readyCount += 1;
     updatePanel(panel, {
       state: "ready",
       status: "Ready",
       answer: parsed.answer,
-      reason: "",
-      meta: "",
+      reason: parsed.reason,
+      meta: parsed.meta,
     });
-    setStatus("running", `${question.label}: hint ready`, {
-      readyCount: runtimeState.readyCount,
-      queueCount: taskQueue.length + activeRequests,
-    });
+    if (!isPaused(currentSettings)) {
+      setStatus("running", `${question.label}: hint ready`, {
+        readyCount: runtimeState.readyCount,
+        queueCount: taskQueue.length + activeRequests,
+      });
+    }
   } catch (error) {
     console.error("Failed to fetch answer:", error);
     runtimeState.errorCount += 1;
@@ -930,14 +1081,23 @@ async function hydratePanel(question, panel) {
       reason: normalizeText(error?.message || ""),
       meta: "",
     });
-    setStatus("error", `${question.label}: failed to fetch hint`, {
-      errorCount: runtimeState.errorCount,
-      queueCount: taskQueue.length + activeRequests,
-    });
+    if (!isPaused(currentSettings)) {
+      setStatus("error", `${question.label}: failed to fetch hint`, {
+        errorCount: runtimeState.errorCount,
+        queueCount: taskQueue.length + activeRequests,
+      });
+    }
   } finally {
     delete panel.dataset.loadingKey;
 
     if (activeRequests === 1 && taskQueue.length === 0) {
+      if (isPaused(currentSettings)) {
+        setStatus("idle", getPausedMessage(currentSettings), {
+          queueCount: 0,
+        });
+        return;
+      }
+
       const nextPhase = runtimeState.readyCount > 0 ? "ready" : "idle";
       const nextMessage =
         runtimeState.readyCount > 0
@@ -951,11 +1111,19 @@ async function hydratePanel(question, panel) {
   }
 }
 
-function processQuestions() {
+async function processQuestions() {
   ensureStyles();
   ensureStatusWidget();
+  const settings = await loadSettings();
 
   setStatus("scanning", "Scanning page for quiz prompts...");
+
+  if (isPaused(settings)) {
+    setStatus("idle", getPausedMessage(settings), {
+      queueCount: activeRequests,
+    });
+    return;
+  }
 
   const questions = extractQuestions();
   cleanupPanels(questions);
@@ -986,10 +1154,11 @@ function processQuestions() {
 
   for (const question of questions) {
     const panel = ensurePanel(question);
+    const loadKey = getRequestCacheKey(question, settings);
 
     if (
-      panel.dataset.loadedKey === question.key ||
-      panel.dataset.loadingKey === question.key
+      panel.dataset.loadedKey === loadKey ||
+      panel.dataset.loadingKey === loadKey
     ) {
       continue;
     }
@@ -1024,16 +1193,81 @@ function scheduleScan() {
     return;
   }
 
+  if (isPaused(currentSettings)) {
+    setStatus("idle", getPausedMessage(currentSettings), {
+      queueCount: activeRequests,
+    });
+    return;
+  }
+
   setStatus("scanning", "Scan scheduled...");
   scanScheduled = true;
   window.setTimeout(() => {
     scanScheduled = false;
-    processQuestions();
+    processQuestions().catch((error) => {
+      console.error("Failed to process quiz hints:", error);
+      setStatus("error", "Failed to process quiz hints.", {
+        queueCount: taskQueue.length + activeRequests,
+      });
+    });
   }, 250);
 }
 
 window.addEventListener("load", scheduleScan);
 document.addEventListener("readystatechange", scheduleScan);
+
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== "local") {
+    return;
+  }
+
+  const nextRawSettings = { ...currentSettings };
+  let hasRelevantChange = false;
+
+  for (const key of Object.keys(DEFAULT_SETTINGS)) {
+    if (!(key in changes)) {
+      continue;
+    }
+
+    nextRawSettings[key] = changes[key].newValue;
+    hasRelevantChange = true;
+  }
+
+  if (!hasRelevantChange) {
+    return;
+  }
+
+  const nextSettings = normalizeSettings(nextRawSettings);
+  const detailedModeChanged =
+    nextSettings.detailedMode !== currentSettings.detailedMode;
+  const availabilityChanged =
+    nextSettings.enabled !== currentSettings.enabled ||
+    nextSettings.pausedUntil !== currentSettings.pausedUntil;
+
+  currentSettings = nextSettings;
+  settingsLoaded = true;
+  syncStatusWidgetVisibility();
+
+  if (detailedModeChanged) {
+    answerCache.clear();
+    pendingAnswers.clear();
+    resetPanelLoadState({ clearLoaded: true });
+  }
+
+  if (isPaused(nextSettings)) {
+    clearQueuedTasks();
+    resetPanelLoadState();
+    markLoadingPanelsPaused(getPausedMessage(nextSettings));
+    setStatus("idle", getPausedMessage(nextSettings), {
+      queueCount: activeRequests,
+    });
+    return;
+  }
+
+  if (availabilityChanged || detailedModeChanged) {
+    scheduleScan();
+  }
+});
 
 const observer = new MutationObserver((mutations) => {
   const shouldScan = mutations.some((mutation) => {
