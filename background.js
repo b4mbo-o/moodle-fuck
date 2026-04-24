@@ -1,11 +1,7 @@
 const BASE_URL = "https://capi.voids.top/v2";
-const PRIMARY_MODEL_ID = "gemini-2.5-flash-lite";
-const FALLBACK_MODEL_IDS = ["gpt-4o-2024-11-20"];
-const ENDPOINTS = [
-  `${BASE_URL}/chat/completions`,
-  `${BASE_URL}/chat`,
-  `${BASE_URL}/completions`,
-];
+const PRIMARY_MODEL_ID = "gpt-4o-2024-11-20";
+const FALLBACK_MODEL_IDS = ["gpt-4.1", "gemini-2.5-flash"];
+const ENDPOINTS = [`${BASE_URL}/chat/completions`];
 
 const SYSTEM_PROMPT =
   "You solve Moodle quiz questions. " +
@@ -27,7 +23,7 @@ const INVALID_ANSWER_PATTERNS = [
 ];
 
 const NUMBER_QUESTION_PATTERN =
-  /(?:\u4F55\u500B|\u3044\u304F\u3064|\u4F55\u4EBA|\u4F55\u56DE|\u4F55\u672C|\u4F55\u679A|\u4F55\u6B73|\u4F55\u70B9|\u4F55%|\u4F55\u30D1\u30FC\u30BB\u30F3\u30C8|how many|how much|number of|count)/i;
+  /(?:\u4F55\u500B|\u3044\u304F\u3064|\u4F55\u4EBA|\u4F55\u56DE|\u4F55\u672C|\u4F55\u679A|\u4F55\u6B73|\u4F55\u70B9|\u4F55%|\u4F55\u30D1\u30FC\u30BB\u30F3\u30C8|\u4F55\u4E57|\u6307\u6570|\[blank\]\s*\u4E57|\u4E57\u3067\u3042\u308B|how many|how much|number of|count|exponent|power)/i;
 
 const answerCache = new Map();
 
@@ -65,7 +61,13 @@ function detectAnswerMode(question, options, targetType = "standard") {
   return "short";
 }
 
-function buildQuizPrompt(question, options, targetType = "standard", compactMode = false) {
+function buildQuizPrompt(
+  question,
+  options,
+  targetType = "standard",
+  compactMode = false,
+  detailedMode = false
+) {
   const cleanedOptions = Array.isArray(options)
     ? options.map((option) => normalizeText(option)).filter(Boolean)
     : [];
@@ -78,6 +80,16 @@ function buildQuizPrompt(question, options, targetType = "standard", compactMode
     "Return only one line.",
     "Do not add explanations or reasons.",
   ];
+
+  if (question.includes("[blank]")) {
+    instructions.push("The text contains one [blank] marker.");
+    instructions.push("Return only the exact content that should replace [blank].");
+    instructions.push("Do not rewrite the whole sentence or expression.");
+  }
+
+  if (detailedMode) {
+    instructions.push("Think carefully before answering, but keep the output to the final answer only.");
+  }
 
   if (containsJapanese(question)) {
     instructions.push("The answer must be in Japanese.");
@@ -116,24 +128,35 @@ function buildQuizPrompt(question, options, targetType = "standard", compactMode
   ].join("\n");
 }
 
-function buildRequestPlans(question, options, targetType = "standard") {
+function buildRequestPlans(
+  question,
+  options,
+  targetType = "standard",
+  detailedMode = false
+) {
   const answerMode = detectAnswerMode(question, options, targetType);
-  const maxTokens = answerMode === "short" ? 24 : 12;
+  const maxTokens = detailedMode
+    ? answerMode === "short"
+      ? 40
+      : 20
+    : answerMode === "short"
+      ? 24
+      : 12;
 
   return [
     {
       model: PRIMARY_MODEL_ID,
-      prompt: buildQuizPrompt(question, options, targetType, false),
+      prompt: buildQuizPrompt(question, options, targetType, false, detailedMode),
       maxTokens,
     },
     {
       model: PRIMARY_MODEL_ID,
-      prompt: buildQuizPrompt(question, options, targetType, true),
+      prompt: buildQuizPrompt(question, options, targetType, true, detailedMode),
       maxTokens,
     },
     ...FALLBACK_MODEL_IDS.map((model) => ({
       model,
-      prompt: buildQuizPrompt(question, options, targetType, true),
+      prompt: buildQuizPrompt(question, options, targetType, true, detailedMode),
       maxTokens,
     })),
   ];
@@ -155,6 +178,7 @@ async function readJsonResponse(response) {
     const message =
       data?.error?.message ||
       data?.message ||
+      raw.trim() ||
       `HTTP ${response.status} ${response.statusText}`;
     throw new Error(message);
   }
@@ -268,7 +292,16 @@ function sanitizeAnswer(answer, question, options, targetType = "standard") {
   }
 
   if (answerMode === "number") {
-    const numericMatch = rawAnswer.match(/-?\d+(?:\.\d+)?/);
+    const normalizedAnswer = rawAnswer.replace(/[−–—]/g, "-");
+    const exponentMatch = normalizedAnswer.match(/\^\s*(-?\d+(?:\.\d+)?)/);
+    if (
+      exponentMatch &&
+      /(?:\u4F55\u4E57|\u6307\u6570|\[blank\]\s*\u4E57|\u4E57\u3067\u3042\u308B|exponent|power)/i.test(question)
+    ) {
+      return exponentMatch[1];
+    }
+
+    const numericMatch = normalizedAnswer.match(/-?\d+(?:\.\d+)?/);
     return numericMatch ? numericMatch[0] : "";
   }
 
@@ -348,6 +381,9 @@ async function requestChatCompletion(model, prompt, maxTokens) {
       if (answer) {
         return answer;
       }
+
+      lastError = new Error(`Empty response from ${endpoint}`);
+      console.warn(`capi returned no answer for ${endpoint}:`, data);
     } catch (error) {
       lastError = error;
       console.warn(`capi request failed for ${endpoint}:`, error);
@@ -357,7 +393,13 @@ async function requestChatCompletion(model, prompt, maxTokens) {
   throw new Error(lastError?.message || "Failed to get a response from capi.");
 }
 
-async function callCapiChat(question, options, requestKey = "", targetType = "standard") {
+async function callCapiChat(
+  question,
+  options,
+  requestKey = "",
+  targetType = "standard",
+  detailedMode = false
+) {
   const cleanedQuestion = normalizeText(question);
   const cleanedOptions = Array.isArray(options)
     ? options.map((option) => normalizeText(option)).filter(Boolean)
@@ -366,16 +408,26 @@ async function callCapiChat(question, options, requestKey = "", targetType = "st
     requestKey: requestKey || cleanedQuestion,
     options: cleanedOptions,
     targetType,
+    detailedMode: Boolean(detailedMode),
   });
 
   if (answerCache.has(cacheKey)) {
-    return answerCache.get(cacheKey);
+    const cached = answerCache.get(cacheKey);
+    if (typeof cached === "string") {
+      return { answer: cached, model: "" };
+    }
+    return cached;
   }
 
   let lastInvalidAnswer = "";
   let lastError = null;
 
-  for (const plan of buildRequestPlans(cleanedQuestion, cleanedOptions, targetType)) {
+  for (const plan of buildRequestPlans(
+    cleanedQuestion,
+    cleanedOptions,
+    targetType,
+    detailedMode
+  )) {
     try {
       const rawAnswer = await requestChatCompletion(
         plan.model,
@@ -405,8 +457,12 @@ async function callCapiChat(question, options, requestKey = "", targetType = "st
         continue;
       }
 
-      answerCache.set(cacheKey, sanitizedAnswer);
-      return sanitizedAnswer;
+      const result = {
+        answer: sanitizedAnswer,
+        model: plan.model,
+      };
+      answerCache.set(cacheKey, result);
+      return result;
     } catch (error) {
       lastError = error;
       console.warn(`capi request failed for model ${plan.model}:`, error);
@@ -425,17 +481,26 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return false;
   }
 
-  const { question, options, requestKey, targetType, fieldLabel } = request;
-  console.log("Received from content:", question, options, targetType, fieldLabel);
+  const { question, options, requestKey, targetType, fieldLabel, detailedMode } = request;
+  console.log("Received from content:", question, options, targetType, fieldLabel, detailedMode);
 
-  callCapiChat(question, options, requestKey, targetType)
-    .then((answer) => {
-      console.log("Parsed answer:", answer);
-      sendResponse({ answer });
+  callCapiChat(question, options, requestKey, targetType, detailedMode)
+    .then((result) => {
+      const answer = normalizeText(
+        typeof result === "string" ? result : result?.answer || ""
+      );
+      const model = normalizeText(
+        typeof result === "object" ? result?.model || "" : ""
+      );
+
+      console.log("Parsed answer:", answer, "model:", model || "(unknown)");
+      sendResponse({ answer, model });
     })
     .catch((error) => {
       console.error("Error calling capi:", error);
-      sendResponse({ answer: "Error fetching answer." });
+      sendResponse({
+        error: normalizeText(error?.message || "Error fetching answer."),
+      });
     });
 
   return true;
