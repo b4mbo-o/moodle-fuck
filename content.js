@@ -1,4 +1,4 @@
-const HINT_STYLE_ID = "moodle-hint-style";
+﻿const HINT_STYLE_ID = "moodle-hint-style";
 const HINT_PANEL_CLASS = "moodle-hint-panel";
 const STATUS_WIDGET_ID = "moodle-hint-status-widget";
 const PRIMARY_QUESTION_SELECTOR = ".que";
@@ -12,6 +12,7 @@ const taskQueue = [];
 
 let activeRequests = 0;
 let scanScheduled = false;
+let deferredScanRequested = false;
 
 const runtimeState = {
   phase: "booting",
@@ -27,6 +28,8 @@ const DEFAULT_SETTINGS = {
   pausedUntil: 0,
   detailedMode: false,
   showStatusWidget: true,
+  materialMode: false,
+  materialRevision: 0,
 };
 
 let currentSettings = { ...DEFAULT_SETTINGS };
@@ -45,6 +48,8 @@ function normalizeSettings(raw = {}) {
     pausedUntil: Number(raw.pausedUntil) || 0,
     detailedMode: Boolean(raw.detailedMode),
     showStatusWidget: raw.showStatusWidget !== false,
+    materialMode: Boolean(raw.materialMode),
+    materialRevision: Number(raw.materialRevision) || 0,
   };
 }
 
@@ -52,6 +57,8 @@ function getRequestCacheKey(question, settings = currentSettings) {
   return JSON.stringify({
     questionKey: question.key,
     detailedMode: Boolean(settings.detailedMode),
+    materialMode: Boolean(settings.materialMode),
+    materialRevision: Number(settings.materialRevision) || 0,
   });
 }
 
@@ -70,11 +77,11 @@ function formatPausedUntil(timestamp) {
 
 function getPausedMessage(settings = currentSettings) {
   if (!settings.enabled) {
-    return "Popupから停止中です。";
+    return "Disabled from popup.";
   }
 
   if (settings.pausedUntil > Date.now()) {
-    return `${formatPausedUntil(settings.pausedUntil)} まで一時停止中です。`;
+    return `Paused until ${formatPausedUntil(settings.pausedUntil)}.`;
   }
 
   return "";
@@ -236,6 +243,33 @@ function ensureStyles() {
       margin-top: 10px;
       font-size: 12px;
       color: #64748b;
+    }
+
+    .moodle-hint-actions {
+      margin-top: 10px;
+      display: none;
+      justify-content: flex-end;
+    }
+
+    .${HINT_PANEL_CLASS}[data-state="error"] .moodle-hint-actions {
+      display: flex;
+    }
+
+    .moodle-hint-retry {
+      appearance: none;
+      border: 1px solid rgba(15, 23, 42, 0.18);
+      border-radius: 8px;
+      background: #ffffff;
+      color: #0f172a;
+      font: inherit;
+      font-size: 12px;
+      font-weight: 700;
+      padding: 6px 10px;
+      cursor: pointer;
+    }
+
+    .moodle-hint-retry:hover {
+      border-color: rgba(15, 23, 42, 0.34);
     }
 
     .moodle-hint-reason:empty,
@@ -637,25 +671,33 @@ function extractTextAroundSubquestion(promptContainer, subquestion) {
 
 function inferSubquestionFieldInfo(promptContainer, subquestion, index) {
   const { before, after } = extractTextAroundSubquestion(promptContainer, subquestion);
-  const normalizedBefore = before.replace(/\s+/g, "");
-  const normalizedAfter = after.replace(/\s+/g, "");
-  const symbolIndex = normalizedBefore.lastIndexOf("記号");
-  const nameIndex = normalizedBefore.lastIndexOf("名称");
+  const beforeCompact = before.toLowerCase().replace(/\s+/g, "");
+  const afterCompact = after.toLowerCase().replace(/\s+/g, "");
 
-  if (symbolIndex > nameIndex) {
-    return { type: "symbol", label: "記号" };
+  const symbolKeywords = [
+    /symbol/i,
+    /unit/i,
+    /\u8A18\u53F7/,
+    /\u5358\u4F4D/,
+  ];
+  const nameKeywords = [
+    /name/i,
+    /\u540D\u524D/,
+    /\u540D\u79F0/,
+    /\u30AB\u30BF\u30AB\u30CA/,
+  ];
+
+  const beforeHasSymbol = symbolKeywords.some((pattern) => pattern.test(beforeCompact));
+  const beforeHasName = nameKeywords.some((pattern) => pattern.test(beforeCompact));
+  const afterHasSymbol = symbolKeywords.some((pattern) => pattern.test(afterCompact));
+  const afterHasName = nameKeywords.some((pattern) => pattern.test(afterCompact));
+
+  if (beforeHasSymbol || afterHasSymbol) {
+    return { type: "symbol", label: "Symbol" };
   }
 
-  if (nameIndex > symbolIndex) {
-    return { type: "name", label: "名称" };
-  }
-
-  if (normalizedAfter.startsWith("名称")) {
-    return { type: "symbol", label: "記号" };
-  }
-
-  if (normalizedAfter.startsWith("記号")) {
-    return { type: "symbol", label: "記号" };
+  if (beforeHasName || afterHasName) {
+    return { type: "name", label: "Name" };
   }
 
   return {
@@ -672,7 +714,7 @@ function buildSubquestionText(questionRoot, promptContainer) {
 }
 
 function getSubquestionLabel(questionRoot, promptText, index, fieldInfo) {
-  const matchedPromptLabel = promptText.match(/(?:問題|Question)\s*([0-9０-９]+)/u);
+  const matchedPromptLabel = promptText.match(/question\s*([0-9]+)/i);
   const suffix = fieldInfo?.label ? ` ${fieldInfo.label}` : "";
 
   if (matchedPromptLabel) {
@@ -792,6 +834,9 @@ function ensurePanel(question) {
     <div class="moodle-hint-answer">Generating hint...</div>
     <div class="moodle-hint-reason"></div>
     <div class="moodle-hint-meta"></div>
+    <div class="moodle-hint-actions">
+      <button class="moodle-hint-retry" type="button">Retry</button>
+    </div>
   `;
 
   anchor.appendChild(panel);
@@ -806,6 +851,13 @@ function ensurePanel(question) {
     anchorTarget.insertAdjacentElement("afterend", anchor);
   } else if (question.questionRoot) {
     question.questionRoot.appendChild(anchor);
+  }
+
+  const retryButton = panel.querySelector(".moodle-hint-retry");
+  if (retryButton) {
+    retryButton.addEventListener("click", () => {
+      retryHint(question, panel);
+    });
   }
 
   return panel;
@@ -842,6 +894,31 @@ function updatePanel(panel, payload) {
   panel.querySelector(".moodle-hint-answer").textContent = payload.answer;
   panel.querySelector(".moodle-hint-reason").textContent = payload.reason || "";
   panel.querySelector(".moodle-hint-meta").textContent = payload.meta || "";
+}
+
+function retryHint(question, panel) {
+  loadSettings().then((settings) => {
+    if (isPaused(settings)) {
+      return;
+    }
+
+    delete panel.dataset.loadedKey;
+    delete panel.dataset.loadingKey;
+
+    const cacheKey = getRequestCacheKey(question, settings);
+    answerCache.delete(cacheKey);
+    pendingAnswers.delete(cacheKey);
+
+    updatePanel(panel, {
+      state: "loading",
+      status: "Retrying...",
+      answer: "Retrying hint...",
+      reason: "",
+      meta: "",
+    });
+
+    enqueue(() => hydratePanel(question, panel, { force: true }));
+  });
 }
 
 function clearQueuedTasks() {
@@ -906,6 +983,9 @@ function parseAnswerText(answerPayload) {
   const modelName = normalizeText(
     typeof answerPayload === "object" ? answerPayload?.model || "" : ""
   );
+  const providerName = normalizeText(
+    typeof answerPayload === "object" ? answerPayload?.provider || "" : ""
+  );
 
   const answer = String(answerText || "")
     .split(/\r?\n/)
@@ -923,7 +1003,14 @@ function parseAnswerText(answerPayload) {
   return {
     answer,
     reason: "",
-    meta: modelName ? `Model: ${modelName}` : "",
+    meta:
+      modelName && providerName
+        ? `Provider: ${providerName} | Model: ${modelName}`
+        : modelName
+          ? `Model: ${modelName}`
+          : providerName
+            ? `Provider: ${providerName}`
+            : "",
   };
 }
 
@@ -948,6 +1035,8 @@ function requestAnswer(question) {
         targetType: question.targetType || "standard",
         fieldLabel: question.fieldLabel || "",
         detailedMode: Boolean(currentSettings.detailedMode),
+        materialMode: Boolean(currentSettings.materialMode),
+        materialRevision: Number(currentSettings.materialRevision) || 0,
       },
       (response) => {
         const runtimeError = chrome.runtime.lastError;
@@ -971,6 +1060,7 @@ function requestAnswer(question) {
         const result = {
           answer,
           model: normalizeText(response?.model || ""),
+          provider: normalizeText(response?.provider || ""),
         };
 
         answerCache.set(cacheKey, result);
@@ -1020,18 +1110,30 @@ function runQueue() {
             });
           }
         }
+
+        if (
+          activeRequests === 0 &&
+          taskQueue.length === 0 &&
+          deferredScanRequested &&
+          !isPaused(currentSettings)
+        ) {
+          deferredScanRequested = false;
+          scheduleScan();
+        }
+
         runQueue();
       });
   }
 }
 
-async function hydratePanel(question, panel) {
+async function hydratePanel(question, panel, options = {}) {
+  const force = Boolean(options.force);
   const settings = await loadSettings();
   const loadKey = getRequestCacheKey(question, settings);
 
   if (
-    panel.dataset.loadedKey === loadKey ||
-    panel.dataset.loadingKey === loadKey
+    !force &&
+    (panel.dataset.loadedKey === loadKey || panel.dataset.loadingKey === loadKey)
   ) {
     return;
   }
@@ -1200,7 +1302,11 @@ function scheduleScan() {
     return;
   }
 
-  setStatus("scanning", "Scan scheduled...");
+  if (activeRequests > 0 || taskQueue.length > 0) {
+    deferredScanRequested = true;
+    return;
+  }
+
   scanScheduled = true;
   window.setTimeout(() => {
     scanScheduled = false;
@@ -1240,6 +1346,9 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   const nextSettings = normalizeSettings(nextRawSettings);
   const detailedModeChanged =
     nextSettings.detailedMode !== currentSettings.detailedMode;
+  const materialChanged =
+    nextSettings.materialMode !== currentSettings.materialMode ||
+    nextSettings.materialRevision !== currentSettings.materialRevision;
   const availabilityChanged =
     nextSettings.enabled !== currentSettings.enabled ||
     nextSettings.pausedUntil !== currentSettings.pausedUntil;
@@ -1248,13 +1357,14 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   settingsLoaded = true;
   syncStatusWidgetVisibility();
 
-  if (detailedModeChanged) {
+  if (detailedModeChanged || materialChanged) {
     answerCache.clear();
     pendingAnswers.clear();
     resetPanelLoadState({ clearLoaded: true });
   }
 
   if (isPaused(nextSettings)) {
+    deferredScanRequested = false;
     clearQueuedTasks();
     resetPanelLoadState();
     markLoadingPanelsPaused(getPausedMessage(nextSettings));
@@ -1264,7 +1374,7 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
     return;
   }
 
-  if (availabilityChanged || detailedModeChanged) {
+  if (availabilityChanged || detailedModeChanged || materialChanged) {
     scheduleScan();
   }
 });
@@ -1326,3 +1436,4 @@ if (document.body) {
 }
 
 scheduleScan();
+
