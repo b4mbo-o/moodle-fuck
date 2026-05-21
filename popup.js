@@ -7,7 +7,7 @@ const DEFAULT_SETTINGS = {
   materialContext: "",
   materialSources: [],
   materialRevision: 0,
-  apiProviders: ["openai"],
+  apiProviders: ["openrouter", "gemini"],
   openaiApiKey: "",
   openrouterApiKey: "",
   geminiApiKey: "",
@@ -18,7 +18,7 @@ const PROVIDER_OPENAI = "openai";
 const PROVIDER_OPENROUTER = "openrouter";
 const PROVIDER_GEMINI = "gemini";
 const PROVIDER_CAPI = "capi";
-const DEFAULT_PROVIDER_ORDER = [PROVIDER_OPENAI];
+const DEFAULT_PROVIDER_ORDER = [PROVIDER_OPENROUTER, PROVIDER_GEMINI];
 const PROVIDER_DISPLAY_NAMES = {
   [PROVIDER_OPENAI]: "OpenAI",
   [PROVIDER_OPENROUTER]: "OpenRouter",

@@ -4,6 +4,7 @@ const PROVIDER_GEMINI = "gemini";
 const PROVIDER_CAPI = "capi";
 const OPENAI_ENDPOINT = "https://api.openai.com/v1/chat/completions";
 const OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions";
+const OPENROUTER_KEY_ENDPOINT = "https://openrouter.ai/api/v1/key";
 const GEMINI_ENDPOINT_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
 const CAPI_BASE_URL = "https://capi.voids.top/v2";
 const CAPI_ENDPOINTS = [
@@ -22,19 +23,18 @@ const OPENAI_MATERIAL_ACCURACY_MODEL_IDS = [
   "gpt-4.1",
 ];
 
-const OPENROUTER_STANDARD_MODEL_IDS = [
-  "openrouter/free",
-  "meta-llama/llama-3.2-3b-instruct:free",
+const OPENROUTER_FREE_STANDARD_MODEL_IDS = [
+  "openai/gpt-oss-120b:free",
 ];
-const OPENROUTER_MATERIAL_ACCURACY_MODEL_IDS = [
-  "openrouter/free",
-  "meta-llama/llama-3.3-70b-instruct:free",
-  "meta-llama/llama-3.2-3b-instruct:free",
+const OPENROUTER_FREE_MATERIAL_ACCURACY_MODEL_IDS = [
+  "openai/gpt-oss-120b:free",
 ];
+const OPENROUTER_PAID_STANDARD_MODEL_IDS = [];
+const OPENROUTER_PAID_MATERIAL_ACCURACY_MODEL_IDS = [];
 const GEMINI_STANDARD_MODEL_IDS = ["gemini-2.5-flash-lite", "gemini-2.5-flash"];
 const GEMINI_MATERIAL_ACCURACY_MODEL_IDS = [
-  "gemini-2.5-flash",
   "gemini-2.5-flash-lite",
+  "gemini-2.5-flash",
 ];
 const CAPI_STANDARD_MODEL_IDS = ["gpt-4o-2024-11-20", "gpt-4o", "gpt-4.1"];
 const CAPI_MATERIAL_ACCURACY_MODEL_IDS = [
@@ -42,7 +42,7 @@ const CAPI_MATERIAL_ACCURACY_MODEL_IDS = [
   "gpt-4.1",
   "gemini-2.5-flash",
 ];
-const DEFAULT_PROVIDER_ORDER = [PROVIDER_OPENAI];
+const DEFAULT_PROVIDER_ORDER = [PROVIDER_OPENROUTER, PROVIDER_GEMINI];
 const MATERIAL_CONTEXT_MAX_CHARS = 120000;
 const MATERIAL_REFERENCE_MAX_CHARS = 9000;
 const MATERIAL_CHUNK_MAX_CHARS = 1400;
@@ -50,6 +50,8 @@ const MATERIAL_TOP_CHUNKS = 4;
 const MATERIAL_MAX_TERMS = 40;
 const REQUEST_MAX_ATTEMPTS = 4;
 const REQUEST_MAX_BACKOFF_MS = 15000;
+const OPENROUTER_FREE_MODEL_MAX_ATTEMPTS = 3;
+const OPENROUTER_KEY_STATUS_TTL_MS = 60 * 1000;
 const MATERIAL_DEFAULTS = {
   materialMode: false,
   materialContext: "",
@@ -85,6 +87,10 @@ const NUMBER_QUESTION_PATTERN =
   /(?:\u4F55\u500B|\u3044\u304F\u3064|\u4F55\u4EBA|\u4F55\u56DE|\u4F55\u672C|\u4F55\u679A|\u4F55\u6B73|\u4F55\u70B9|\u4F55%|\u4F55\u30D1\u30FC\u30BB\u30F3\u30C8|\u4F55\u4E57|\u6307\u6570|\[blank\]\s*\u4E57|\u4E57\u3067\u3042\u308B|how many|how much|number of|count|exponent|power)/i;
 
 const answerCache = new Map();
+const openRouterRuntimeState = {
+  keyStatusExpiresAt: 0,
+  keyLimitRemaining: null,
+};
 
 function normalizeText(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
@@ -185,6 +191,84 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
 }
 
+function isOpenRouterFreeModel(modelId) {
+  const normalized = normalizeText(modelId).toLowerCase();
+  return normalized === "openrouter/free" || normalized.endsWith(":free");
+}
+
+function isOpenRouterFreeLimitMessage(message) {
+  const text = normalizeText(message).toLowerCase();
+  if (!text) {
+    return false;
+  }
+
+  return /free-models-per-min|free-models-per-day|free tier|free-tier|insufficient credits|credit limit reached|quota exceeded|payment required|limit_remaining|limit remaining/.test(
+    text
+  );
+}
+
+function extractOpenRouterLimitRemaining(data) {
+  const nestedValue = Number(data?.data?.limit_remaining);
+  if (Number.isFinite(nestedValue)) {
+    return nestedValue;
+  }
+
+  const directValue = Number(data?.limit_remaining);
+  if (Number.isFinite(directValue)) {
+    return directValue;
+  }
+
+  return null;
+}
+
+async function getOpenRouterKeyStatus(credentials) {
+  const now = Date.now();
+  if (openRouterRuntimeState.keyStatusExpiresAt > now) {
+    return {
+      limitRemaining: openRouterRuntimeState.keyLimitRemaining,
+    };
+  }
+
+  try {
+    const response = await fetch(OPENROUTER_KEY_ENDPOINT, {
+      method: "GET",
+      headers: buildRequestHeaders(PROVIDER_OPENROUTER, credentials),
+    });
+    const data = await readJsonResponse(response);
+    openRouterRuntimeState.keyLimitRemaining = extractOpenRouterLimitRemaining(
+      data
+    );
+  } catch (error) {
+    openRouterRuntimeState.keyLimitRemaining = null;
+    console.warn("OpenRouter key status check failed:", error);
+  } finally {
+    openRouterRuntimeState.keyStatusExpiresAt = now + OPENROUTER_KEY_STATUS_TTL_MS;
+  }
+
+  return {
+    limitRemaining: openRouterRuntimeState.keyLimitRemaining,
+  };
+}
+
+async function resolveOpenRouterBudgetMode(credentials) {
+  const keyStatus = await getOpenRouterKeyStatus(credentials);
+  if (
+    typeof keyStatus.limitRemaining === "number" &&
+    keyStatus.limitRemaining <= 0
+  ) {
+    return "free_only";
+  }
+
+  if (
+    typeof keyStatus.limitRemaining === "number" &&
+    keyStatus.limitRemaining > 0
+  ) {
+    return "free_then_paid";
+  }
+
+  return "free_then_paid";
+}
+
 function buildRequestHeaders(providerId, credentials) {
   const headers = {
     "Content-Type": "application/json",
@@ -282,11 +366,27 @@ function dedupeModels(modelIds) {
   return models;
 }
 
-function getModelChain(providerId, useAccuracyProfile = false) {
+function getModelChain(
+  providerId,
+  useAccuracyProfile = false,
+  modelPolicy = {}
+) {
   if (providerId === PROVIDER_OPENROUTER) {
-    return useAccuracyProfile
-      ? dedupeModels(OPENROUTER_MATERIAL_ACCURACY_MODEL_IDS)
-      : dedupeModels(OPENROUTER_STANDARD_MODEL_IDS);
+    const freeModels = useAccuracyProfile
+      ? dedupeModels(OPENROUTER_FREE_MATERIAL_ACCURACY_MODEL_IDS)
+      : dedupeModels(OPENROUTER_FREE_STANDARD_MODEL_IDS);
+    const paidModels = useAccuracyProfile
+      ? dedupeModels(OPENROUTER_PAID_MATERIAL_ACCURACY_MODEL_IDS)
+      : dedupeModels(OPENROUTER_PAID_STANDARD_MODEL_IDS);
+    const mode =
+      normalizeText(modelPolicy?.openRouterBudgetMode).toLowerCase() ||
+      "free_then_paid";
+
+    if (mode === "free_only") {
+      return freeModels;
+    }
+
+    return dedupeModels([...freeModels, ...paidModels]);
   }
 
   if (providerId === PROVIDER_CAPI) {
@@ -306,11 +406,15 @@ function getModelChain(providerId, useAccuracyProfile = false) {
     : dedupeModels(OPENAI_STANDARD_MODEL_IDS);
 }
 
-function buildProviderModelPlans(providerOrder, useAccuracyProfile = false) {
+function buildProviderModelPlans(
+  providerOrder,
+  useAccuracyProfile = false,
+  modelPolicy = {}
+) {
   const plans = [];
 
   for (const providerId of normalizeProviderOrder(providerOrder)) {
-    const models = getModelChain(providerId, useAccuracyProfile);
+    const models = getModelChain(providerId, useAccuracyProfile, modelPolicy);
     for (const model of models) {
       plans.push({ providerId, model });
     }
@@ -354,6 +458,29 @@ function filterProvidersByCredentials(providerOrder, credentials) {
   }
 
   return available;
+}
+
+function prioritizeOpenRouterThenGemini(providerOrder) {
+  const normalized = normalizeProviderOrder(providerOrder);
+  if (!normalized.length) {
+    return normalized;
+  }
+
+  const ordered = [];
+  if (normalized.includes(PROVIDER_OPENROUTER)) {
+    ordered.push(PROVIDER_OPENROUTER);
+  }
+  if (normalized.includes(PROVIDER_GEMINI)) {
+    ordered.push(PROVIDER_GEMINI);
+  }
+
+  for (const provider of normalized) {
+    if (!ordered.includes(provider)) {
+      ordered.push(provider);
+    }
+  }
+
+  return ordered;
 }
 
 function uniqueTerms(terms) {
@@ -660,7 +787,8 @@ function buildRequestPlans(
   detailedMode = false,
   materialContext = "",
   useAccuracyProfile = false,
-  providerOrder = DEFAULT_PROVIDER_ORDER
+  providerOrder = DEFAULT_PROVIDER_ORDER,
+  modelPolicy = {}
 ) {
   const answerMode = detectAnswerMode(question, options, targetType);
   const hasMaterial = Boolean(normalizeMaterialContext(materialContext));
@@ -689,40 +817,33 @@ function buildRequestPlans(
 
   const providerModelPlans = buildProviderModelPlans(
     providerOrder,
-    useAccuracyProfile
+    useAccuracyProfile,
+    modelPolicy
   );
   if (!providerModelPlans.length) {
     return [];
   }
 
   const [primaryPlan, ...fallbackPlans] = providerModelPlans;
+  const primaryIsOpenRouterFree =
+    primaryPlan.providerId === PROVIDER_OPENROUTER &&
+    isOpenRouterFreeModel(primaryPlan.model);
+  const primaryPromptModes = primaryIsOpenRouterFree ? [false] : [false, true];
+
   return [
-    {
+    ...primaryPromptModes.map((compactMode) => ({
       providerId: primaryPlan.providerId,
       model: primaryPlan.model,
       prompt: buildQuizPrompt(
         question,
         options,
         targetType,
-        false,
+        compactMode,
         effectiveDetailedMode,
         materialContext
       ),
       maxTokens: safeMaxTokens,
-    },
-    {
-      providerId: primaryPlan.providerId,
-      model: primaryPlan.model,
-      prompt: buildQuizPrompt(
-        question,
-        options,
-        targetType,
-        true,
-        effectiveDetailedMode,
-        materialContext
-      ),
-      maxTokens: safeMaxTokens,
-    },
+    })),
     ...fallbackPlans.map((plan) => ({
       providerId: plan.providerId,
       model: plan.model,
@@ -1133,6 +1254,8 @@ async function requestChatCompletion(
   maxTokens,
   credentials
 ) {
+  const isOpenRouterFreeRequest =
+    providerId === PROVIDER_OPENROUTER && isOpenRouterFreeModel(model);
   const baseMaxTokens =
     providerId === PROVIDER_OPENROUTER
       ? Math.max(48, Number(maxTokens) || 48)
@@ -1145,8 +1268,11 @@ async function requestChatCompletion(
   let lastError = null;
   const providerLabel = getProviderLabel(providerId);
   const endpointCandidates = getProviderEndpoints(providerId, model);
+  const maxAttempts = isOpenRouterFreeRequest
+    ? Math.min(REQUEST_MAX_ATTEMPTS, OPENROUTER_FREE_MODEL_MAX_ATTEMPTS)
+    : REQUEST_MAX_ATTEMPTS;
 
-  for (let attempt = 0; attempt < REQUEST_MAX_ATTEMPTS; attempt += 1) {
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     const attemptMaxTokens =
       providerId === PROVIDER_OPENROUTER
         ? Math.min(320, baseMaxTokens * Math.pow(2, attempt))
@@ -1233,14 +1359,27 @@ async function requestChatCompletion(
           `${providerLabel} returned no answer for ${endpoint} (max_tokens=${attemptMaxTokens}):`,
           data
         );
-        shouldRetryAttempt = attempt < REQUEST_MAX_ATTEMPTS - 1;
+        shouldRetryAttempt = attempt < maxAttempts - 1;
       } catch (error) {
         lastError = error;
+        const freeLimitExhausted =
+          isOpenRouterFreeRequest &&
+          (Number(error?.status) === 402 ||
+            isOpenRouterFreeLimitMessage(error?.message));
+        if (freeLimitExhausted) {
+          shouldRetryAttempt = false;
+          console.warn("OpenRouter free model limit reached:", {
+            model,
+            reason: normalizeText(error?.message || "free limit reached"),
+          });
+          break;
+        }
+
         const canRetry =
-          isRetryableError(error) && attempt < REQUEST_MAX_ATTEMPTS - 1;
+          isRetryableError(error) && attempt < maxAttempts - 1;
 
         console.warn(
-          `${providerLabel} request failed for ${endpoint} (attempt ${attempt + 1}/${REQUEST_MAX_ATTEMPTS}):`,
+          `${providerLabel} request failed for ${endpoint} (attempt ${attempt + 1}/${maxAttempts}):`,
           error
         );
 
@@ -1280,6 +1419,25 @@ async function requestChatCompletion(
   );
 }
 
+async function buildModelPolicy(providerOrder, credentials) {
+  const normalizedProviders = normalizeProviderOrder(providerOrder);
+  const policy = {
+    openRouterBudgetMode: "free_then_paid",
+  };
+
+  if (!normalizedProviders.includes(PROVIDER_OPENROUTER)) {
+    return policy;
+  }
+
+  try {
+    policy.openRouterBudgetMode = await resolveOpenRouterBudgetMode(credentials);
+  } catch (error) {
+    console.warn("Failed to resolve OpenRouter budget mode. Using default mode:", error);
+  }
+
+  return policy;
+}
+
 async function callCapiChat(
   question,
   options,
@@ -1297,6 +1455,7 @@ async function callCapiChat(
   const cleanedOptions = Array.isArray(options)
     ? options.map((option) => normalizeText(option)).filter(Boolean)
     : [];
+  const modelPolicy = await buildModelPolicy(providerOrder, credentials);
   const cacheKey = JSON.stringify({
     requestKey: requestKey || cleanedQuestion,
     options: cleanedOptions,
@@ -1306,6 +1465,7 @@ async function callCapiChat(
     materialRevision: Number(materialRevision) || 0,
     useAccuracyProfile: Boolean(useAccuracyProfile),
     providerOrder: normalizeProviderOrder(providerOrder),
+    openRouterBudgetMode: modelPolicy.openRouterBudgetMode,
   });
 
   if (answerCache.has(cacheKey)) {
@@ -1315,6 +1475,8 @@ async function callCapiChat(
     }
     return cached;
   }
+
+  console.log("OpenRouter budget mode:", modelPolicy.openRouterBudgetMode);
 
   let lastInvalidAnswer = "";
   let lastError = null;
@@ -1326,7 +1488,8 @@ async function callCapiChat(
     detailedMode,
     materialContext,
     useAccuracyProfile,
-    providerOrder
+    providerOrder,
+    modelPolicy
   )) {
     try {
       const response = await requestChatCompletion(
@@ -1411,9 +1574,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   loadMaterialState()
     .then((materialState) => {
-      const activeProviders = filterProvidersByCredentials(
+      const activeProviders = prioritizeOpenRouterThenGemini(
+        filterProvidersByCredentials(
         materialState.apiProviders,
         materialState
+        )
       );
       if (!activeProviders.length) {
         throw new Error(
