@@ -8,16 +8,19 @@ Chrome 拡張で Moodle の穴埋め/選択問題のヒント生成を支援す�
 ### 1. モデル選択とフォールバック
 
 - デフォルトの優先順は `OpenRouter -> Gemini`。
-- OpenRouter ではまず `openai/gpt-oss-120b:free` を優先して使用。
-- 無料モデルが失敗した場合は Gemini 側へフォールバック。
-- 無料モデルの試行回数は最大 3 回に制限（待ち時間短縮のため）。
+- OpenRouter では Gemini 系モデルを最初から使用（`google/gemini-2.5-flash-lite` -> `google/gemini-2.5-flash` -> `google/gemini-2.0-flash-001` -> `google/gemini-2.0-flash-lite-001`）。
+- Free API Mode が ON の場合は、OpenRouter の `:free` モデルを先に試してから Gemini 系モデルへフォールバック。
+- Detailed Mode / 資料優先モードでは `google/gemini-2.5-pro` -> `google/gemini-2.5-flash` -> `google/gemini-2.5-flash-lite` の順で使用。
+- OpenRouter が失敗した場合は、設定されていれば Gemini API 側へフォールバック。
+- Provider の優先順位は popup の並び順を尊重。Gemini API が quota / 残高なし系で失敗した場合は、Gemini の残りモデルを飛ばして次の provider へ進む。
+- 複数問検出時もAI API呼び出しは最大2本までに抑え、詰まったリクエストは15秒で切る。
 - 実際に使われた `Provider` / `Model` はヒントパネルに表示。
 
 ### 2. OpenRouter の制限考慮
 
-- `GET https://openrouter.ai/api/v1/key` を参照してキー情報を取得。
+- 現在のデフォルトは OpenRouter の有料/通常 Gemini モデルなので、無料枠チェックは通常スキップ。
 - レート制限は OpenRouter 公式 Limits に準拠して扱う。
-- `:free` モデル利用時は、無料枠エラー（例: `free-models-per-min`, `free-models-per-day`, `402`）を検知して次の候補へ進む。
+- `:free` モデル利用時のみ、無料枠エラー（例: `free-models-per-min`, `free-models-per-day`, `402`）を検知して次の候補へ進む。
 
 参考: https://openrouter.ai/docs/api/reference/limits
 
@@ -27,7 +30,15 @@ Chrome 拡張で Moodle の穴埋め/選択問題のヒント生成を支援す�
 - 問題文に関連する断片を抽出し、回答生成時に優先参照。
 - 資料モード有効時は精度寄りのプロンプトに切替。
 
-### 4. UI/UX
+### 4. 画像付き問題への対応
+
+- 問題文（`.qtext` / `.formulation`）内の `<img>` を検出し、base64 化して AI に添付。
+- 画像がある問題では vision 非対応モデル（`gpt-oss` / `qwen3-coder` / `deepseek` 系）を自動でスキップし、Gemini など vision 対応モデルへ。
+- 1 問あたり最大 4 枚、6MB まで。32px 未満のアイコン類は除外。
+- 画像の取得結果はキャッシュされ、同じ画像を何度も取得しない（失敗時は次回スキャンで再試行）。
+- 標準モードでは Gemini 2.5 Flash の thinking を無効化して空応答を防止（詳細モード・画像付き問題では thinking を許可）。
+
+### 5. UI/UX
 
 - ヒントパネルに `Retry` ボタンあり（その問題だけ再実行）。
 - ステータスウィジェット表示/非表示切替あり。

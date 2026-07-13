@@ -4,6 +4,7 @@ const DEFAULT_SETTINGS = {
   detailedMode: false,
   showStatusWidget: true,
   materialMode: false,
+  freeApiMode: false,
   materialContext: "",
   materialSources: [],
   materialRevision: 0,
@@ -53,6 +54,7 @@ const enabledToggle = document.getElementById("enabledToggle");
 const detailedToggle = document.getElementById("detailedToggle");
 const statusWidgetToggle = document.getElementById("statusWidgetToggle");
 const materialModeToggle = document.getElementById("materialModeToggle");
+const freeApiModeToggle = document.getElementById("freeApiModeToggle");
 const materialsInput = document.getElementById("materialsInput");
 const materialsText = document.getElementById("materialsText");
 const importMaterialsButton = document.getElementById("importMaterialsButton");
@@ -127,6 +129,7 @@ function normalizeSettings(raw = {}) {
     detailedMode: Boolean(raw.detailedMode),
     showStatusWidget: raw.showStatusWidget !== false,
     materialMode: Boolean(raw.materialMode),
+    freeApiMode: Boolean(raw.freeApiMode),
     materialContext: typeof raw.materialContext === "string" ? raw.materialContext : "",
     materialSources,
     materialRevision: Number(raw.materialRevision) || 0,
@@ -446,6 +449,7 @@ function renderApiKeySummary(settings) {
       : "Gemini key: not set"
   );
   lines.push("CAPI key: not required");
+  lines.push(`Free API mode: ${settings.freeApiMode ? "ON" : "OFF"}`);
   apiKeyNote.textContent = lines.join("\n");
 }
 
@@ -454,6 +458,9 @@ function render(settings) {
   detailedToggle.checked = settings.detailedMode;
   statusWidgetToggle.checked = settings.showStatusWidget;
   materialModeToggle.checked = settings.materialMode;
+  if (freeApiModeToggle) {
+    freeApiModeToggle.checked = settings.freeApiMode;
+  }
   providerOrderDraft = normalizeProviderOrder(settings.apiProviders);
   renderProviderPriority();
   openaiApiKeyInput.value = settings.openaiApiKey || "";
@@ -514,6 +521,15 @@ statusWidgetToggle.addEventListener("change", async () => {
   });
   await refresh();
 });
+
+if (freeApiModeToggle) {
+  freeApiModeToggle.addEventListener("change", async () => {
+    await saveSettings({
+      freeApiMode: freeApiModeToggle.checked,
+    });
+    await refresh();
+  });
+}
 
 materialModeToggle.addEventListener("change", async () => {
   await saveSettings({
@@ -713,6 +729,7 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
     "pausedUntil",
     "detailedMode",
     "showStatusWidget",
+    "freeApiMode",
     "materialMode",
     "materialContext",
     "materialSources",

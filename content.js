@@ -5,8 +5,11 @@ const PRIMARY_QUESTION_SELECTOR = ".que";
 const FALLBACK_QUESTION_SELECTOR = "[id^='question-']";
 const SUBQUESTION_SELECTOR = ".subquestion";
 const MAX_CONCURRENT_REQUESTS = 2;
+const MAX_IMAGES_PER_QUESTION = 4;
+const MAX_IMAGE_BYTES = 6 * 1024 * 1024;
 
 const answerCache = new Map();
+const imageDataUrlCache = new Map();
 const pendingAnswers = new Map();
 const taskQueue = [];
 
@@ -29,6 +32,7 @@ const DEFAULT_SETTINGS = {
   detailedMode: false,
   showStatusWidget: true,
   materialMode: false,
+  freeApiMode: false,
   materialRevision: 0,
 };
 
@@ -49,6 +53,7 @@ function normalizeSettings(raw = {}) {
     detailedMode: Boolean(raw.detailedMode),
     showStatusWidget: raw.showStatusWidget !== false,
     materialMode: Boolean(raw.materialMode),
+    freeApiMode: Boolean(raw.freeApiMode),
     materialRevision: Number(raw.materialRevision) || 0,
   };
 }
@@ -58,6 +63,7 @@ function getRequestCacheKey(question, settings = currentSettings) {
     questionKey: question.key,
     detailedMode: Boolean(settings.detailedMode),
     materialMode: Boolean(settings.materialMode),
+    freeApiMode: Boolean(settings.freeApiMode),
     materialRevision: Number(settings.materialRevision) || 0,
   });
 }
@@ -392,11 +398,12 @@ function ensureStyles() {
   (document.head || document.documentElement).appendChild(style);
 }
 
-function buildQuestionKey(questionText, options, uniqueId = "") {
+function buildQuestionKey(questionText, options, uniqueId = "", imageUrls = []) {
   return JSON.stringify({
     questionText,
     options,
     uniqueId,
+    imageUrls,
   });
 }
 
@@ -773,12 +780,130 @@ function extractSubquestions() {
         targetType: fieldInfo.type,
         fieldLabel: fieldInfo.label,
         requestKey: uniqueId,
+        uniqueId,
       };
     })
     .filter(Boolean);
 }
 
-function extractQuestions() {
+function getImageContainer(questionRoot) {
+  return (
+    questionRoot.querySelector(".qtext") ||
+    (questionRoot.matches(".formulation")
+      ? questionRoot
+      : questionRoot.querySelector(".formulation")) ||
+    questionRoot
+  );
+}
+
+function collectQuestionImageElements(container) {
+  if (!container) {
+    return [];
+  }
+
+  return Array.from(container.querySelectorAll("img")).filter((img) => {
+    if (
+      img.closest(`.${HINT_PANEL_CLASS}`) ||
+      img.closest(".moodle-hint-anchor") ||
+      img.closest(`#${STATUS_WIDGET_ID}`)
+    ) {
+      return false;
+    }
+
+    // Skip tiny decorations (icons, emoticons) once dimensions are known.
+    if (
+      img.complete &&
+      img.naturalWidth > 0 &&
+      (img.naturalWidth < 32 || img.naturalHeight < 32)
+    ) {
+      return false;
+    }
+
+    return Boolean(img.currentSrc || img.src);
+  });
+}
+
+function blobToDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () =>
+      reject(reader.error || new Error("Failed to read image blob."));
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function fetchImageAsDataUrl(url) {
+  const response = await fetch(url, { credentials: "include" });
+  if (!response.ok) {
+    throw new Error(`Failed to fetch image (${response.status}): ${url}`);
+  }
+
+  const blob = await response.blob();
+  if (blob.size > MAX_IMAGE_BYTES) {
+    throw new Error(`Image too large to send: ${url}`);
+  }
+
+  return blobToDataUrl(blob);
+}
+
+function getImageDataUrl(url) {
+  // Cache promises so concurrent scans share one fetch; drop failures so the
+  // next scan can retry.
+  let promise = imageDataUrlCache.get(url);
+  if (!promise) {
+    promise = fetchImageAsDataUrl(url).catch((error) => {
+      imageDataUrlCache.delete(url);
+      throw error;
+    });
+    imageDataUrlCache.set(url, promise);
+  }
+
+  return promise;
+}
+
+async function extractQuestionImages(container) {
+  const imgElements = collectQuestionImageElements(container).slice(
+    0,
+    MAX_IMAGES_PER_QUESTION
+  );
+
+  const images = [];
+  for (const img of imgElements) {
+    const url = img.currentSrc || img.src;
+    if (!url) {
+      continue;
+    }
+
+    try {
+      const dataUrl = await getImageDataUrl(url);
+      images.push({ url, dataUrl });
+    } catch (error) {
+      console.warn("Failed to load question image:", url, error);
+    }
+  }
+
+  return images;
+}
+
+async function attachQuestionImages(questions) {
+  await Promise.all(
+    questions.map(async (question) => {
+      const container = getImageContainer(question.questionRoot);
+      question.images = await extractQuestionImages(container);
+      question.key = buildQuestionKey(
+        question.questionText,
+        question.options,
+        question.uniqueId || "",
+        question.images.map((image) => image.url)
+      );
+    })
+  );
+
+  return questions;
+}
+
+async function extractQuestions() {
   const standardQuestions = getQuestionRoots()
     .map((questionRoot) => {
       if (questionRoot.querySelector(SUBQUESTION_SELECTOR)) {
@@ -791,14 +916,16 @@ function extractQuestions() {
       }
 
       const options = extractOptions(questionRoot);
+      const uniqueId = questionRoot.id || "";
       return {
-        key: buildQuestionKey(questionText, options, questionRoot.id || ""),
+        key: buildQuestionKey(questionText, options, uniqueId),
         label: getQuestionLabel(questionRoot),
         questionRoot,
         questionText,
         options,
         targetType: "standard",
         requestKey: questionRoot.id || questionText,
+        uniqueId,
         anchorElement:
           questionRoot.querySelector(".formulation") ||
           questionRoot.querySelector(".content") ||
@@ -808,7 +935,9 @@ function extractQuestions() {
     .filter(Boolean);
 
   const subquestions = extractSubquestions();
-  return [...standardQuestions, ...subquestions];
+  const questions = [...standardQuestions, ...subquestions];
+  await attachQuestionImages(questions);
+  return questions;
 }
 
 function ensurePanel(question) {
@@ -824,14 +953,14 @@ function ensurePanel(question) {
 
   const panel = document.createElement("aside");
   panel.className = HINT_PANEL_CLASS;
-  panel.dataset.state = "loading";
+  panel.dataset.state = "idle";
   panel.dataset.questionKey = question.key;
   panel.innerHTML = `
     <div class="moodle-hint-header">
       <div class="moodle-hint-title">${question.label} Hint</div>
-      <div class="moodle-hint-status">Loading...</div>
+      <div class="moodle-hint-status">Queued</div>
     </div>
-    <div class="moodle-hint-answer">Generating hint...</div>
+    <div class="moodle-hint-answer">Waiting for turn...</div>
     <div class="moodle-hint-reason"></div>
     <div class="moodle-hint-meta"></div>
     <div class="moodle-hint-actions">
@@ -899,6 +1028,13 @@ function updatePanel(panel, payload) {
 function retryHint(question, panel) {
   loadSettings().then((settings) => {
     if (isPaused(settings)) {
+      updatePanel(panel, {
+        state: "idle",
+        status: "Paused",
+        answer: getPausedMessage(settings) || "Paused.",
+        reason: "",
+        meta: "",
+      });
       return;
     }
 
@@ -1031,6 +1167,7 @@ function requestAnswer(question) {
         action: "getAnswer",
         question: question.questionText,
         options: question.options,
+        images: (question.images || []).map((image) => image.dataUrl),
         requestKey: question.requestKey || question.key,
         targetType: question.targetType || "standard",
         fieldLabel: question.fieldLabel || "",
@@ -1227,7 +1364,7 @@ async function processQuestions() {
     return;
   }
 
-  const questions = extractQuestions();
+  const questions = await extractQuestions();
   cleanupPanels(questions);
   runtimeState.questionCount = questions.length;
 
@@ -1349,6 +1486,8 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   const materialChanged =
     nextSettings.materialMode !== currentSettings.materialMode ||
     nextSettings.materialRevision !== currentSettings.materialRevision;
+  const apiModeChanged =
+    nextSettings.freeApiMode !== currentSettings.freeApiMode;
   const availabilityChanged =
     nextSettings.enabled !== currentSettings.enabled ||
     nextSettings.pausedUntil !== currentSettings.pausedUntil;
@@ -1357,7 +1496,7 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   settingsLoaded = true;
   syncStatusWidgetVisibility();
 
-  if (detailedModeChanged || materialChanged) {
+  if (detailedModeChanged || materialChanged || apiModeChanged) {
     answerCache.clear();
     pendingAnswers.clear();
     resetPanelLoadState({ clearLoaded: true });
@@ -1374,7 +1513,7 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
     return;
   }
 
-  if (availabilityChanged || detailedModeChanged || materialChanged) {
+  if (availabilityChanged || detailedModeChanged || materialChanged || apiModeChanged) {
     scheduleScan();
   }
 });

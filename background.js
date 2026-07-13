@@ -23,18 +23,44 @@ const OPENAI_MATERIAL_ACCURACY_MODEL_IDS = [
   "gpt-4.1",
 ];
 
+const OPENROUTER_GEMINI_STANDARD_MODEL_IDS = [
+  "google/gemini-2.5-flash-lite",
+  "google/gemini-2.5-flash",
+  "google/gemini-2.0-flash-001",
+  "google/gemini-2.0-flash-lite-001",
+];
+const OPENROUTER_GEMINI_MATERIAL_ACCURACY_MODEL_IDS = [
+  "google/gemini-2.5-pro",
+  "google/gemini-2.5-flash",
+  "google/gemini-2.5-flash-lite",
+];
+const OPENROUTER_GEMINI_DETAILED_MODEL_IDS = [
+  "google/gemini-2.5-pro",
+  "google/gemini-2.5-flash",
+  "google/gemini-2.5-flash-lite",
+];
 const OPENROUTER_FREE_STANDARD_MODEL_IDS = [
+  "qwen/qwen3-coder:free",
+  "deepseek/deepseek-v4-flash:free",
   "openai/gpt-oss-120b:free",
+  "google/gemma-4-31b-it:free",
 ];
 const OPENROUTER_FREE_MATERIAL_ACCURACY_MODEL_IDS = [
+  "qwen/qwen3-coder:free",
   "openai/gpt-oss-120b:free",
+  "deepseek/deepseek-v4-flash:free",
+  "google/gemma-4-31b-it:free",
 ];
-const OPENROUTER_PAID_STANDARD_MODEL_IDS = [];
-const OPENROUTER_PAID_MATERIAL_ACCURACY_MODEL_IDS = [];
 const GEMINI_STANDARD_MODEL_IDS = ["gemini-2.5-flash-lite", "gemini-2.5-flash"];
 const GEMINI_MATERIAL_ACCURACY_MODEL_IDS = [
-  "gemini-2.5-flash-lite",
+  "gemini-2.5-pro",
   "gemini-2.5-flash",
+  "gemini-2.5-flash-lite",
+];
+const GEMINI_DETAILED_MODEL_IDS = [
+  "gemini-2.5-pro",
+  "gemini-2.5-flash",
+  "gemini-2.5-flash-lite",
 ];
 const CAPI_STANDARD_MODEL_IDS = ["gpt-4o-2024-11-20", "gpt-4o", "gpt-4.1"];
 const CAPI_MATERIAL_ACCURACY_MODEL_IDS = [
@@ -48,15 +74,24 @@ const MATERIAL_REFERENCE_MAX_CHARS = 9000;
 const MATERIAL_CHUNK_MAX_CHARS = 1400;
 const MATERIAL_TOP_CHUNKS = 4;
 const MATERIAL_MAX_TERMS = 40;
-const REQUEST_MAX_ATTEMPTS = 4;
+const REQUEST_MAX_ATTEMPTS = 2;
+const REQUEST_TIMEOUT_MS = 15000;
 const REQUEST_MAX_BACKOFF_MS = 15000;
+const AI_REQUEST_MAX_CONCURRENT = 2;
+const AI_REQUEST_MIN_INTERVAL_MS = 350;
 const OPENROUTER_FREE_MODEL_MAX_ATTEMPTS = 3;
 const OPENROUTER_KEY_STATUS_TTL_MS = 60 * 1000;
+const MAX_REQUEST_IMAGES = 4;
+const MAX_IMAGE_DATA_URL_LENGTH = 8 * 1024 * 1024;
+const IMAGE_QUESTION_MIN_TOKENS = 96;
+// Models that cannot read images; skipped when the question has attachments.
+const NON_VISION_MODEL_PATTERN = /gpt-oss|qwen3-coder|deepseek/i;
 const MATERIAL_DEFAULTS = {
   materialMode: false,
   materialContext: "",
   materialSources: [],
   materialRevision: 0,
+  freeApiMode: false,
   apiProviders: DEFAULT_PROVIDER_ORDER,
   openaiApiKey: "",
   openrouterApiKey: "",
@@ -85,12 +120,26 @@ const INVALID_ANSWER_PATTERNS = [
 
 const NUMBER_QUESTION_PATTERN =
   /(?:\u4F55\u500B|\u3044\u304F\u3064|\u4F55\u4EBA|\u4F55\u56DE|\u4F55\u672C|\u4F55\u679A|\u4F55\u6B73|\u4F55\u70B9|\u4F55%|\u4F55\u30D1\u30FC\u30BB\u30F3\u30C8|\u4F55\u4E57|\u6307\u6570|\[blank\]\s*\u4E57|\u4E57\u3067\u3042\u308B|how many|how much|number of|count|exponent|power)/i;
+const SYMBOL_ANSWER_PATTERN =
+  /^(?:[A-Za-z\u00B5\u03BC\u0370-\u03FF]{1,4}|(?:<=|>=|!=|==|->|=>|[<>\u007C\u2264\u2265=\u2260\u2248~+\-\u2212*\u00D7\u00F7\/\u00B1%\u2030\u00B0^\u221A\u221E\u2211\u222B\u2202\u2206\u0394]){1,8})$/u;
+const SYMBOL_OPERATOR_PATTERN =
+  /(?:<=|>=|!=|==|->|=>|[<>\u007C\u2264\u2265=\u2260\u2248~+\-\u2212*\u00D7\u00F7\/\u00B1%\u2030\u00B0^\u221A\u221E\u2211\u222B\u2202\u2206\u0394])/u;
+const SYMBOL_TEXT_PATTERN =
+  /\b(?:da|[fpnumcdhkMGTP]|mu|pi|theta|lambda|alpha|beta|gamma|delta|omega)\b|[\u00B5\u03BC\u0370-\u03FF]/u;
+const SHORT_CODE_ANSWER_PATTERN =
+  /^[A-Za-z0-9][A-Za-z0-9._+:/@-]{0,80}$/;
+const SHELL_COMMAND_ANSWER_PATTERN =
+  /^[A-Za-z][A-Za-z0-9._+-]*(?:\s+[A-Za-z0-9._+:/@%*?\[\]{}$~=-]+){1,8}$/;
 
 const answerCache = new Map();
+const aiRequestQueue = [];
 const openRouterRuntimeState = {
   keyStatusExpiresAt: 0,
   keyLimitRemaining: null,
 };
+let activeAiRequests = 0;
+let aiRequestRunnerScheduled = false;
+let lastAiRequestStartedAt = 0;
 
 function normalizeText(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
@@ -113,6 +162,36 @@ function compactText(value) {
 
 function containsJapanese(text) {
   return /[\u3040-\u30ff\u3400-\u9fff]/.test(text);
+}
+
+function sanitizeImages(images) {
+  if (!Array.isArray(images)) {
+    return [];
+  }
+
+  return images
+    .filter((value) => typeof value === "string" && value.startsWith("data:image/"))
+    .filter((value) => value.length <= MAX_IMAGE_DATA_URL_LENGTH)
+    .slice(0, MAX_REQUEST_IMAGES);
+}
+
+function parseDataUrl(dataUrl) {
+  const match = /^data:([^;,]+)?(;base64)?,(.*)$/s.exec(String(dataUrl || ""));
+  if (!match) {
+    return null;
+  }
+
+  const mimeType = match[1] || "application/octet-stream";
+  const isBase64 = Boolean(match[2]);
+  const data = match[3] || "";
+  if (!data) {
+    return null;
+  }
+
+  return {
+    mimeType,
+    base64: isBase64 ? data : btoa(unescape(encodeURIComponent(data))),
+  };
 }
 
 function parseRetryAfterMs(value) {
@@ -138,6 +217,7 @@ function createHttpError(message, options = {}) {
   error.status = Number(options.status) || 0;
   error.isRateLimit = Boolean(options.isRateLimit);
   error.isAuthError = Boolean(options.isAuthError);
+  error.skipRemainingProvider = Boolean(options.skipRemainingProvider);
   error.retryAfterMs = Number(options.retryAfterMs) || 0;
   return error;
 }
@@ -150,6 +230,26 @@ function isInvalidApiKeyText(text) {
   return /invalid\s*api\s*key|invalid\s*apikey|api\s*key\s*not\s*valid|unauthorized|forbidden|no\s*auth\s*credentials/i.test(
     normalizeText(text)
   );
+}
+
+function isQuotaOrBalanceText(text) {
+  return /quota|resource[_\s-]*exhausted|rate[\s-]?limit|too many requests|billing|balance|credit|insufficient|payment required|exceeded|exhausted/i.test(
+    normalizeText(text)
+  );
+}
+
+function isGeminiQuotaOrBalanceError(error) {
+  if (!error) {
+    return false;
+  }
+
+  const status = Number(error.status) || 0;
+  if (status === 429 || status === 402) {
+    return true;
+  }
+
+  const message = normalizeText(error.message);
+  return (status === 403 && isQuotaOrBalanceText(message)) || isQuotaOrBalanceText(message);
 }
 
 function isRetryableError(error) {
@@ -189,6 +289,52 @@ function getRetryDelayMs(error, attemptIndex) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+}
+
+function enqueueAiRequest(task) {
+  return new Promise((resolve, reject) => {
+    aiRequestQueue.push({ task, resolve, reject });
+    runAiRequestQueue();
+  });
+}
+
+function scheduleAiRequestQueue(delayMs) {
+  if (aiRequestRunnerScheduled) {
+    return;
+  }
+
+  aiRequestRunnerScheduled = true;
+  setTimeout(() => {
+    aiRequestRunnerScheduled = false;
+    runAiRequestQueue();
+  }, Math.max(0, delayMs));
+}
+
+function runAiRequestQueue() {
+  if (activeAiRequests >= AI_REQUEST_MAX_CONCURRENT || !aiRequestQueue.length) {
+    return;
+  }
+
+  const waitMs = Math.max(
+    0,
+    lastAiRequestStartedAt + AI_REQUEST_MIN_INTERVAL_MS - Date.now()
+  );
+  if (waitMs > 0) {
+    scheduleAiRequestQueue(waitMs);
+    return;
+  }
+
+  const job = aiRequestQueue.shift();
+  activeAiRequests += 1;
+  lastAiRequestStartedAt = Date.now();
+
+  Promise.resolve()
+    .then(job.task)
+    .then(job.resolve, job.reject)
+    .finally(() => {
+      activeAiRequests -= 1;
+      runAiRequestQueue();
+    });
 }
 
 function isOpenRouterFreeModel(modelId) {
@@ -372,21 +518,29 @@ function getModelChain(
   modelPolicy = {}
 ) {
   if (providerId === PROVIDER_OPENROUTER) {
+    const useDetailedProfile = Boolean(modelPolicy?.detailedMode);
     const freeModels = useAccuracyProfile
       ? dedupeModels(OPENROUTER_FREE_MATERIAL_ACCURACY_MODEL_IDS)
       : dedupeModels(OPENROUTER_FREE_STANDARD_MODEL_IDS);
-    const paidModels = useAccuracyProfile
-      ? dedupeModels(OPENROUTER_PAID_MATERIAL_ACCURACY_MODEL_IDS)
-      : dedupeModels(OPENROUTER_PAID_STANDARD_MODEL_IDS);
+    const geminiModels = useDetailedProfile
+      ? dedupeModels(OPENROUTER_GEMINI_DETAILED_MODEL_IDS)
+      : useAccuracyProfile
+      ? dedupeModels(OPENROUTER_GEMINI_MATERIAL_ACCURACY_MODEL_IDS)
+      : dedupeModels(OPENROUTER_GEMINI_STANDARD_MODEL_IDS);
+    const freeApiMode = Boolean(modelPolicy?.freeApiMode);
     const mode =
       normalizeText(modelPolicy?.openRouterBudgetMode).toLowerCase() ||
       "free_then_paid";
 
-    if (mode === "free_only") {
+    if (freeApiMode && mode === "free_only") {
       return freeModels;
     }
 
-    return dedupeModels([...freeModels, ...paidModels]);
+    if (freeApiMode) {
+      return dedupeModels([...freeModels, ...geminiModels]);
+    }
+
+    return geminiModels;
   }
 
   if (providerId === PROVIDER_CAPI) {
@@ -396,6 +550,10 @@ function getModelChain(
   }
 
   if (providerId === PROVIDER_GEMINI) {
+    if (modelPolicy?.detailedMode) {
+      return dedupeModels(GEMINI_DETAILED_MODEL_IDS);
+    }
+
     return useAccuracyProfile
       ? dedupeModels(GEMINI_MATERIAL_ACCURACY_MODEL_IDS)
       : dedupeModels(GEMINI_STANDARD_MODEL_IDS);
@@ -458,29 +616,6 @@ function filterProvidersByCredentials(providerOrder, credentials) {
   }
 
   return available;
-}
-
-function prioritizeOpenRouterThenGemini(providerOrder) {
-  const normalized = normalizeProviderOrder(providerOrder);
-  if (!normalized.length) {
-    return normalized;
-  }
-
-  const ordered = [];
-  if (normalized.includes(PROVIDER_OPENROUTER)) {
-    ordered.push(PROVIDER_OPENROUTER);
-  }
-  if (normalized.includes(PROVIDER_GEMINI)) {
-    ordered.push(PROVIDER_GEMINI);
-  }
-
-  for (const provider of normalized) {
-    if (!ordered.includes(provider)) {
-      ordered.push(provider);
-    }
-  }
-
-  return ordered;
 }
 
 function uniqueTerms(terms) {
@@ -698,7 +833,8 @@ function buildQuizPrompt(
   targetType = "standard",
   compactMode = false,
   detailedMode = false,
-  materialContext = ""
+  materialContext = "",
+  hasImages = false
 ) {
   const cleanedOptions = Array.isArray(options)
     ? options.map((option) => normalizeText(option)).filter(Boolean)
@@ -724,6 +860,15 @@ function buildQuizPrompt(
     instructions.push("Do not rewrite the whole sentence or expression.");
   }
 
+  if (hasImages) {
+    instructions.push(
+      "One or more images are attached with this question (screenshots, diagrams, or code)."
+    );
+    instructions.push(
+      "Read any text, code, or diagrams in the attached images carefully before answering."
+    );
+  }
+
   if (detailedMode) {
     instructions.push("Think carefully before answering, but keep the output to the final answer only.");
   }
@@ -737,7 +882,7 @@ function buildQuizPrompt(
     instructions.push("Copy the chosen option text exactly.");
   } else if (answerMode === "symbol") {
     instructions.push("Return only the requested symbol.");
-    instructions.push("Use only the symbol itself, such as f, p, n, u, m, c, d, da, h, k, M, G, T, P.");
+    instructions.push("Use only the symbol itself, such as |, >, <, >=, <=, =, !=, +, -, f, p, n, u, m, c, d, da, h, k, M, G, T, P.");
   } else if (answerMode === "name") {
     instructions.push("Return only the requested name.");
     instructions.push("If the question asks for katakana, use katakana only.");
@@ -788,11 +933,13 @@ function buildRequestPlans(
   materialContext = "",
   useAccuracyProfile = false,
   providerOrder = DEFAULT_PROVIDER_ORDER,
-  modelPolicy = {}
+  modelPolicy = {},
+  images = []
 ) {
   const answerMode = detectAnswerMode(question, options, targetType);
   const hasMaterial = Boolean(normalizeMaterialContext(materialContext));
   const effectiveDetailedMode = detailedMode || useAccuracyProfile;
+  const hasImages = Boolean(images.length);
 
   const maxTokens = useAccuracyProfile
     ? answerMode === "short"
@@ -813,13 +960,29 @@ function buildRequestPlans(
         : hasMaterial
           ? 24
           : 12;
-  const safeMaxTokens = Math.max(16, maxTokens);
+  const safeMaxTokens = Math.max(
+    16,
+    maxTokens,
+    hasImages ? IMAGE_QUESTION_MIN_TOKENS : 0
+  );
+  const effectiveModelPolicy = {
+    ...modelPolicy,
+    detailedMode: effectiveDetailedMode,
+  };
 
-  const providerModelPlans = buildProviderModelPlans(
+  let providerModelPlans = buildProviderModelPlans(
     providerOrder,
     useAccuracyProfile,
-    modelPolicy
+    effectiveModelPolicy
   );
+  if (hasImages) {
+    const visionPlans = providerModelPlans.filter(
+      (plan) => !NON_VISION_MODEL_PATTERN.test(plan.model)
+    );
+    if (visionPlans.length) {
+      providerModelPlans = visionPlans;
+    }
+  }
   if (!providerModelPlans.length) {
     return [];
   }
@@ -840,9 +1003,12 @@ function buildRequestPlans(
         targetType,
         compactMode,
         effectiveDetailedMode,
-        materialContext
+        materialContext,
+        hasImages
       ),
       maxTokens: safeMaxTokens,
+      images,
+      allowThinking: effectiveDetailedMode || hasImages,
     })),
     ...fallbackPlans.map((plan) => ({
       providerId: plan.providerId,
@@ -853,9 +1019,12 @@ function buildRequestPlans(
         targetType,
         true,
         effectiveDetailedMode,
-        materialContext
+        materialContext,
+        hasImages
       ),
       maxTokens: safeMaxTokens,
+      images,
+      allowThinking: effectiveDetailedMode || hasImages,
     })),
   ];
 }
@@ -866,6 +1035,7 @@ function loadMaterialState() {
       const materialMode = Boolean(items.materialMode);
       const materialRevision = Number(items.materialRevision) || 0;
       const materialSources = normalizeMaterialSources(items.materialSources);
+      const freeApiMode = Boolean(items.freeApiMode);
       const legacyApiKey = normalizeText(items.apiKey);
       const openaiApiKey = normalizeText(items.openaiApiKey || legacyApiKey);
       const openrouterApiKey = normalizeText(items.openrouterApiKey);
@@ -887,6 +1057,7 @@ function loadMaterialState() {
         materialContext,
         materialSources,
         hasPdfSource,
+        freeApiMode,
         apiProviders,
         openaiApiKey,
         openrouterApiKey,
@@ -1120,6 +1291,37 @@ function findMatchingOption(answer, options) {
   );
 }
 
+function questionRequiresKatakana(question) {
+  return /\u30AB\u30BF\u30AB\u30CA|katakana/i.test(normalizeText(question));
+}
+
+function stripLeadingSymbolNoise(answer) {
+  return normalizeText(
+    answer.replace(/^(?:(?:>>|<<|&&|\|\||[<>=!|&;:+*\/\\-]+)\s*)+/g, "")
+  );
+}
+
+function extractNameLikeAnswer(answer, question) {
+  const cleaned = stripLeadingSymbolNoise(answer);
+
+  if (questionRequiresKatakana(question)) {
+    const katakanaMatch = cleaned.match(/[\u30A0-\u30FF\u30FC]+/);
+    return katakanaMatch ? katakanaMatch[0] : cleaned;
+  }
+
+  if (SHELL_COMMAND_ANSWER_PATTERN.test(cleaned)) {
+    return cleaned;
+  }
+
+  const codeToken = cleaned.match(/[A-Za-z0-9][A-Za-z0-9._+:/@-]{0,80}/);
+  if (codeToken) {
+    return codeToken[0];
+  }
+
+  const katakanaMatch = cleaned.match(/[\u30A0-\u30FF\u30FC]+/);
+  return katakanaMatch ? katakanaMatch[0] : cleaned;
+}
+
 function sanitizeAnswer(answer, question, options, targetType = "standard") {
   const answerMode = detectAnswerMode(question, options, targetType);
   const rawAnswer = normalizeText(answer);
@@ -1138,17 +1340,25 @@ function sanitizeAnswer(answer, question, options, targetType = "standard") {
   }
 
   if (answerMode === "symbol") {
-    const symbolMatch =
-      firstLine.match(/[A-Za-z\u00B5\u03BC]{1,3}/) ||
-      rawAnswer.match(/[A-Za-z\u00B5\u03BC]{1,3}/);
-    return symbolMatch ? symbolMatch[0] : firstLine;
+    if (SYMBOL_ANSWER_PATTERN.test(firstLine)) {
+      return firstLine;
+    }
+
+    const operatorMatch =
+      firstLine.match(SYMBOL_OPERATOR_PATTERN) ||
+      rawAnswer.match(SYMBOL_OPERATOR_PATTERN);
+    if (operatorMatch) {
+      return operatorMatch[0];
+    }
+
+    const textSymbolMatch =
+      firstLine.match(SYMBOL_TEXT_PATTERN) ||
+      rawAnswer.match(SYMBOL_TEXT_PATTERN);
+    return textSymbolMatch ? textSymbolMatch[0] : firstLine;
   }
 
   if (answerMode === "name") {
-    const katakanaMatch =
-      firstLine.match(/[\u30A0-\u30FF\u30FC]+/) ||
-      rawAnswer.match(/[\u30A0-\u30FF\u30FC]+/);
-    return katakanaMatch ? katakanaMatch[0] : firstLine;
+    return extractNameLikeAnswer(firstLine, question);
   }
 
   if (answerMode === "number") {
@@ -1190,11 +1400,19 @@ function isLikelyInvalidAnswer(answer, question, options, targetType = "standard
   }
 
   if (answerMode === "symbol") {
-    return !/^[A-Za-z\u00B5\u03BC]{1,3}$/.test(firstLine);
+    return !SYMBOL_ANSWER_PATTERN.test(firstLine);
   }
 
   if (answerMode === "name") {
-    return !/[\u30A0-\u30FF\u30FC]/.test(firstLine);
+    if (questionRequiresKatakana(question)) {
+      return !/[\u30A0-\u30FF\u30FC]/.test(firstLine);
+    }
+
+    return !(
+      SHORT_CODE_ANSWER_PATTERN.test(firstLine) ||
+      SHELL_COMMAND_ANSWER_PATTERN.test(firstLine) ||
+      /[\u30A0-\u30FF\u30FC\u3040-\u30FF\u3400-\u9FFF]/.test(firstLine)
+    );
   }
 
   if (answerMode === "number") {
@@ -1205,7 +1423,9 @@ function isLikelyInvalidAnswer(answer, question, options, targetType = "standard
     containsJapanese(question) &&
     !containsJapanese(firstLine) &&
     /[A-Za-z]{2,}/.test(firstLine) &&
-    !(Array.isArray(options) && options.length)
+    !(Array.isArray(options) && options.length) &&
+    !SHORT_CODE_ANSWER_PATTERN.test(firstLine) &&
+    !SHELL_COMMAND_ANSWER_PATTERN.test(firstLine)
   ) {
     return true;
   }
@@ -1252,8 +1472,13 @@ async function requestChatCompletion(
   model,
   prompt,
   maxTokens,
-  credentials
+  credentials,
+  requestOptions = {}
 ) {
+  const { images = [], allowThinking = true } = requestOptions;
+  const imageParts = images
+    .map((dataUrl) => parseDataUrl(dataUrl))
+    .filter(Boolean);
   const isOpenRouterFreeRequest =
     providerId === PROVIDER_OPENROUTER && isOpenRouterFreeModel(model);
   const baseMaxTokens =
@@ -1284,6 +1509,20 @@ async function requestChatCompletion(
     let payload = null;
 
     if (providerId === PROVIDER_GEMINI) {
+      const userParts = [
+        { text: prompt },
+        ...imageParts.map((image) => ({
+          inlineData: {
+            mimeType: image.mimeType,
+            data: image.base64,
+          },
+        })),
+      ];
+      // Gemini 2.5 Flash thinks by default; with small maxOutputTokens the
+      // thinking budget eats the whole response. Disable it unless the
+      // request benefits (detailed mode / image reading). Pro models do not
+      // accept thinkingBudget 0, so guard on flash.
+      const disableThinking = !allowThinking && /flash/i.test(model);
       payload = {
         systemInstruction: {
           role: "system",
@@ -1292,20 +1531,32 @@ async function requestChatCompletion(
         contents: [
           {
             role: "user",
-            parts: [{ text: prompt }],
+            parts: userParts,
           },
         ],
         generationConfig: {
           temperature: 0,
           maxOutputTokens: attemptMaxTokens,
+          ...(disableThinking
+            ? { thinkingConfig: { thinkingBudget: 0 } }
+            : {}),
         },
       };
     } else {
+      const userContent = imageParts.length
+        ? [
+            { type: "text", text: prompt },
+            ...imageParts.map((image) => ({
+              type: "image_url",
+              image_url: { url: `data:${image.mimeType};base64,${image.base64}` },
+            })),
+          ]
+        : prompt;
       payload = {
         model,
         messages: [
           { role: "system", content: SYSTEM_PROMPT },
-          { role: "user", content: prompt },
+          { role: "user", content: userContent },
         ],
         temperature: 0,
         max_tokens: attemptMaxTokens,
@@ -1320,11 +1571,18 @@ async function requestChatCompletion(
     let shouldRetryAttempt = false;
 
     for (const endpoint of endpointCandidates) {
+      const controller =
+        typeof AbortController === "function" ? new AbortController() : null;
+      const timeoutId = controller
+        ? setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
+        : null;
+
       try {
         const response = await fetch(endpoint, {
           method: "POST",
           headers: buildRequestHeaders(providerId, credentials),
           body: JSON.stringify(payload),
+          signal: controller?.signal,
         });
 
         const data = await readJsonResponse(response);
@@ -1332,10 +1590,17 @@ async function requestChatCompletion(
           data?.error?.message || data?.error || ""
         );
         if (bodyErrorMessage) {
+          const skipRemainingProvider =
+            providerId === PROVIDER_GEMINI &&
+            isGeminiQuotaOrBalanceError({
+              status: Number(data?.error?.code) || response.status,
+              message: bodyErrorMessage,
+            });
           throw createHttpError(bodyErrorMessage, {
             status: Number(data?.error?.code) || response.status,
             isRateLimit: isRateLimitText(bodyErrorMessage),
             isAuthError: isInvalidApiKeyText(bodyErrorMessage),
+            skipRemainingProvider,
             retryAfterMs: parseRetryAfterMs(response.headers.get("retry-after")),
           });
         }
@@ -1361,30 +1626,56 @@ async function requestChatCompletion(
         );
         shouldRetryAttempt = attempt < maxAttempts - 1;
       } catch (error) {
-        lastError = error;
+        const requestError =
+          error?.name === "AbortError"
+            ? createHttpError(
+                `${providerLabel} request timed out after ${Math.round(
+                  REQUEST_TIMEOUT_MS / 1000
+                )}s.`,
+                { status: 0 }
+              )
+            : error;
+        if (
+          providerId === PROVIDER_GEMINI &&
+          isGeminiQuotaOrBalanceError(requestError)
+        ) {
+          requestError.skipRemainingProvider = true;
+          shouldRetryAttempt = false;
+          lastError = requestError;
+          console.warn(
+            "Gemini quota/balance exhausted. Switching to the next provider:",
+            requestError
+          );
+          break;
+        }
+        lastError = requestError;
         const freeLimitExhausted =
           isOpenRouterFreeRequest &&
-          (Number(error?.status) === 402 ||
-            isOpenRouterFreeLimitMessage(error?.message));
+          (Number(requestError?.status) === 402 ||
+            isOpenRouterFreeLimitMessage(requestError?.message));
         if (freeLimitExhausted) {
           shouldRetryAttempt = false;
           console.warn("OpenRouter free model limit reached:", {
             model,
-            reason: normalizeText(error?.message || "free limit reached"),
+            reason: normalizeText(requestError?.message || "free limit reached"),
           });
           break;
         }
 
         const canRetry =
-          isRetryableError(error) && attempt < maxAttempts - 1;
+          isRetryableError(requestError) && attempt < maxAttempts - 1;
 
         console.warn(
           `${providerLabel} request failed for ${endpoint} (attempt ${attempt + 1}/${maxAttempts}):`,
-          error
+          requestError
         );
 
         if (canRetry) {
           shouldRetryAttempt = true;
+        }
+      } finally {
+        if (timeoutId) {
+          clearTimeout(timeoutId);
         }
       }
     }
@@ -1422,10 +1713,19 @@ async function requestChatCompletion(
 async function buildModelPolicy(providerOrder, credentials) {
   const normalizedProviders = normalizeProviderOrder(providerOrder);
   const policy = {
+    freeApiMode: Boolean(credentials?.freeApiMode),
     openRouterBudgetMode: "free_then_paid",
   };
 
   if (!normalizedProviders.includes(PROVIDER_OPENROUTER)) {
+    return policy;
+  }
+
+  const openRouterModels = [
+    ...getModelChain(PROVIDER_OPENROUTER, false, policy),
+    ...getModelChain(PROVIDER_OPENROUTER, true, policy),
+  ];
+  if (!openRouterModels.some(isOpenRouterFreeModel)) {
     return policy;
   }
 
@@ -1449,12 +1749,14 @@ async function callCapiChat(
   materialContext = "",
   useAccuracyProfile = false,
   providerOrder = DEFAULT_PROVIDER_ORDER,
-  credentials = {}
+  credentials = {},
+  images = []
 ) {
   const cleanedQuestion = normalizeText(question);
   const cleanedOptions = Array.isArray(options)
     ? options.map((option) => normalizeText(option)).filter(Boolean)
     : [];
+  const cleanedImages = sanitizeImages(images);
   const modelPolicy = await buildModelPolicy(providerOrder, credentials);
   const cacheKey = JSON.stringify({
     requestKey: requestKey || cleanedQuestion,
@@ -1465,7 +1767,9 @@ async function callCapiChat(
     materialRevision: Number(materialRevision) || 0,
     useAccuracyProfile: Boolean(useAccuracyProfile),
     providerOrder: normalizeProviderOrder(providerOrder),
+    freeApiMode: modelPolicy.freeApiMode,
     openRouterBudgetMode: modelPolicy.openRouterBudgetMode,
+    imagesFingerprint: cleanedImages.map((image) => image.length).join(","),
   });
 
   if (answerCache.has(cacheKey)) {
@@ -1476,10 +1780,14 @@ async function callCapiChat(
     return cached;
   }
 
-  console.log("OpenRouter budget mode:", modelPolicy.openRouterBudgetMode);
+  console.log(
+    "OpenRouter mode:",
+    modelPolicy.freeApiMode ? "free-first" : "Gemini via OpenRouter"
+  );
 
   let lastInvalidAnswer = "";
   let lastError = null;
+  const skippedProviders = new Set();
 
   for (const plan of buildRequestPlans(
     cleanedQuestion,
@@ -1489,15 +1797,21 @@ async function callCapiChat(
     materialContext,
     useAccuracyProfile,
     providerOrder,
-    modelPolicy
+    modelPolicy,
+    cleanedImages
   )) {
+    if (skippedProviders.has(plan.providerId)) {
+      continue;
+    }
+
     try {
       const response = await requestChatCompletion(
         plan.providerId,
         plan.model,
         plan.prompt,
         plan.maxTokens,
-        credentials
+        credentials,
+        { images: plan.images, allowThinking: plan.allowThinking }
       );
       const rawAnswer = response.answer;
       const sanitizedAnswer = sanitizeAnswer(
@@ -1532,6 +1846,9 @@ async function callCapiChat(
       return result;
     } catch (error) {
       lastError = error;
+      if (error?.skipRemainingProvider) {
+        skippedProviders.add(plan.providerId);
+      }
       console.warn(
         `${getProviderLabel(plan.providerId)} request failed for model ${plan.model}:`,
         error
@@ -1548,7 +1865,7 @@ async function callCapiChat(
     lastMessage.includes("Empty response from https://openrouter.ai/api/v1/chat/completions")
   ) {
     throw new Error(
-      "OpenRouter free returned an empty response. Please retry, or enable OpenAI fallback in API Providers."
+      "OpenRouter returned an empty response. Please retry, or enable another fallback provider in API Providers."
     );
   }
 
@@ -1563,6 +1880,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   const {
     question,
     options,
+    images,
     requestKey,
     targetType,
     fieldLabel,
@@ -1570,15 +1888,22 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     materialMode,
     materialRevision,
   } = request;
-  console.log("Received from content:", question, options, targetType, fieldLabel, detailedMode);
+  const cleanedImages = sanitizeImages(images);
+  console.log(
+    "Received from content:",
+    question,
+    options,
+    targetType,
+    fieldLabel,
+    detailedMode,
+    `images=${cleanedImages.length}`
+  );
 
   loadMaterialState()
     .then((materialState) => {
-      const activeProviders = prioritizeOpenRouterThenGemini(
-        filterProvidersByCredentials(
+      const activeProviders = filterProvidersByCredentials(
         materialState.apiProviders,
         materialState
-        )
       );
       if (!activeProviders.length) {
         throw new Error(
@@ -1601,18 +1926,21 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
       console.log("Model profile:", shouldUseAccuracyProfile ? "material-accuracy" : "standard");
 
-      return callCapiChat(
-        question,
-        options,
-        requestKey,
-        targetType,
-        detailedMode,
-        shouldUseMaterial,
-        selectedMaterialRevision,
-        selectedMaterialContext,
-        shouldUseAccuracyProfile,
-        activeProviders,
-        materialState
+      return enqueueAiRequest(() =>
+        callCapiChat(
+          question,
+          options,
+          requestKey,
+          targetType,
+          detailedMode,
+          shouldUseMaterial,
+          selectedMaterialRevision,
+          selectedMaterialContext,
+          shouldUseAccuracyProfile,
+          activeProviders,
+          materialState,
+          cleanedImages
+        )
       );
     })
     .then((result) => {
