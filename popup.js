@@ -19,7 +19,7 @@ const PROVIDER_OPENAI = "openai";
 const PROVIDER_OPENROUTER = "openrouter";
 const PROVIDER_GEMINI = "gemini";
 const PROVIDER_CAPI = "capi";
-const DEFAULT_PROVIDER_ORDER = [PROVIDER_OPENROUTER, PROVIDER_GEMINI];
+const DEFAULT_PROVIDER_ORDER = [PROVIDER_GEMINI, PROVIDER_OPENROUTER];
 const PROVIDER_DISPLAY_NAMES = {
   [PROVIDER_OPENAI]: "OpenAI",
   [PROVIDER_OPENROUTER]: "OpenRouter",
@@ -78,8 +78,14 @@ const apiKeyNote = document.getElementById("apiKeyNote");
 const pauseNote = document.getElementById("pauseNote");
 const resumeButton = document.getElementById("resumeButton");
 const pauseButtons = Array.from(document.querySelectorAll("[data-pause-minutes]"));
+const logsToggleRow = document.getElementById("logsToggleRow");
+const logsChevron = document.getElementById("logsChevron");
+const logsPanel = document.getElementById("logsPanel");
+const logsList = document.getElementById("logsList");
+const clearLogsButton = document.getElementById("clearLogsButton");
 
 let providerOrderDraft = [...DEFAULT_PROVIDER_ORDER];
+let logsExpanded = false;
 
 function normalizeProviderOrder(value, options = {}) {
   const fallbackToDefault = options.fallbackToDefault !== false;
@@ -403,6 +409,23 @@ function renderProviderPriority() {
       rankElement.textContent = enabled ? `#${rankIndex + 1}` : "OFF";
     }
 
+    // CAPI needs no key; the others silently drop out of the fallback chain
+    // at request time if their key field is empty, which otherwise looks
+    // like "this provider is just never used" with no visible explanation.
+    const warningElement = row.querySelector("[data-provider-warning]");
+    if (warningElement) {
+      const keyInput =
+        providerId === PROVIDER_OPENAI
+          ? openaiApiKeyInput
+          : providerId === PROVIDER_OPENROUTER
+            ? openrouterApiKeyInput
+            : providerId === PROVIDER_GEMINI
+              ? geminiApiKeyInput
+              : null;
+      const hasKey = !keyInput || Boolean(String(keyInput.value || "").trim());
+      warningElement.textContent = enabled && !hasKey ? "No API key" : "";
+    }
+
     const upButton = row.querySelector('[data-provider-move="up"]');
     const downButton = row.querySelector('[data-provider-move="down"]');
     if (upButton) {
@@ -462,10 +485,12 @@ function render(settings) {
     freeApiModeToggle.checked = settings.freeApiMode;
   }
   providerOrderDraft = normalizeProviderOrder(settings.apiProviders);
-  renderProviderPriority();
   openaiApiKeyInput.value = settings.openaiApiKey || "";
   openrouterApiKeyInput.value = settings.openrouterApiKey || "";
   geminiApiKeyInput.value = settings.geminiApiKey || "";
+  // Must run after the key inputs are populated above — it reads their
+  // live .value to decide whether to show a "No API key" warning.
+  renderProviderPriority();
   renderApiKeySummary(settings);
 
   const now = Date.now();
@@ -579,14 +604,22 @@ providerMoveButtons.forEach((button) => {
   });
 });
 
-saveApiKeyButton.addEventListener("click", async () => {
+// Refresh the "No API key" warnings live as the user types, before they hit
+// Save — otherwise a just-pasted key still shows the stale warning.
+[openaiApiKeyInput, openrouterApiKeyInput, geminiApiKeyInput].forEach((input) => {
+  if (input) {
+    input.addEventListener("input", () => renderProviderPriority());
+  }
+});
+
+async function saveProviderSettings(noteOnSuccess) {
   const providers = normalizeProviderOrder(providerOrderDraft, {
     fallbackToDefault: false,
   });
 
   if (!providers.length) {
     apiKeyNote.textContent = "Select at least one provider.";
-    return;
+    return false;
   }
 
   const openaiApiKey = String(openaiApiKeyInput.value || "").trim();
@@ -600,8 +633,13 @@ saveApiKeyButton.addEventListener("click", async () => {
     geminiApiKey,
     apiKey: openaiApiKey,
   });
-  apiKeyNote.textContent = "API settings saved.";
+  apiKeyNote.textContent = noteOnSuccess || "API settings saved.";
   await refresh();
+  return true;
+}
+
+saveApiKeyButton.addEventListener("click", async () => {
+  await saveProviderSettings("API settings saved.");
 });
 
 clearApiKeyButton.addEventListener("click", async () => {
@@ -719,9 +757,92 @@ clearMaterialsButton.addEventListener("click", async () => {
   await refresh();
 });
 
+function formatLogTime(timestamp) {
+  return new Intl.DateTimeFormat("ja-JP", {
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  }).format(new Date(timestamp));
+}
+
+function renderLogs(logs) {
+  if (!logsList) {
+    return;
+  }
+
+  if (!logs.length) {
+    logsList.innerHTML = '<div class="logs-empty">No fallback events yet.</div>';
+    return;
+  }
+
+  logsList.innerHTML = logs
+    .slice()
+    .reverse()
+    .map(
+      (entry) => `
+        <div class="logs-entry">
+          <div class="logs-entry-time">${formatLogTime(entry.time)}</div>
+          <div>${String(entry.message || "").replace(/[<>&]/g, (char) => ({
+            "<": "&lt;",
+            ">": "&gt;",
+            "&": "&amp;",
+          })[char])}</div>
+        </div>
+      `
+    )
+    .join("");
+}
+
+function loadAndRenderLogs() {
+  chrome.storage.local.get({ fallbackLogs: [] }, (items) => {
+    renderLogs(Array.isArray(items.fallbackLogs) ? items.fallbackLogs : []);
+  });
+}
+
+function setLogsExpanded(expanded) {
+  logsExpanded = expanded;
+  if (logsPanel) {
+    logsPanel.hidden = !expanded;
+  }
+  if (logsToggleRow) {
+    logsToggleRow.setAttribute("aria-expanded", expanded ? "true" : "false");
+  }
+  if (logsChevron) {
+    logsChevron.textContent = expanded ? "▾" : "▸";
+  }
+  if (expanded) {
+    loadAndRenderLogs();
+  }
+}
+
+if (logsToggleRow) {
+  logsToggleRow.addEventListener("click", () => {
+    setLogsExpanded(!logsExpanded);
+  });
+  logsToggleRow.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      setLogsExpanded(!logsExpanded);
+    }
+  });
+}
+
+if (clearLogsButton) {
+  clearLogsButton.addEventListener("click", async () => {
+    await new Promise((resolve) => chrome.storage.local.set({ fallbackLogs: [] }, resolve));
+    renderLogs([]);
+  });
+}
+
 chrome.storage.onChanged.addListener((changes, areaName) => {
   if (areaName !== "local") {
     return;
+  }
+
+  if ("fallbackLogs" in changes && logsExpanded) {
+    renderLogs(Array.isArray(changes.fallbackLogs.newValue) ? changes.fallbackLogs.newValue : []);
   }
 
   const watchedKeys = [

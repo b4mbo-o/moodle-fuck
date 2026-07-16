@@ -118,7 +118,11 @@ function loadSettings(force = false) {
 }
 
 function renderNodeText(node, options = {}) {
-  const { blankToken = " [blank] " } = options;
+  const {
+    blankToken = " [blank] ",
+    targetSelect = null,
+    otherSelectToken = " ___ ",
+  } = options;
 
   if (!node) {
     return "";
@@ -135,17 +139,38 @@ function renderNodeText(node, options = {}) {
   const element = node;
 
   if (
-    element.matches(".accesshide, script, style, label.subq") ||
+    element.matches(".accesshide, .sr-only, script, style, label.subq") ||
     element.matches(".moodle-hint-anchor") ||
     element.matches(`#${STATUS_WIDGET_ID}`)
   ) {
     return "";
   }
 
+  // Inline dropdowns (gapselect). When a target is set, mark it as [blank] and
+  // the others as neutral placeholders. When a counter is set, number them
+  // [1], [2], ... so all blanks can be answered jointly in one request.
+  if (element.matches("select")) {
+    if (targetSelect) {
+      return element === targetSelect ? blankToken : otherSelectToken;
+    }
+    if (options.selectCounter) {
+      options.selectCounter.value += 1;
+      return ` [${options.selectCounter.value}] `;
+    }
+    return blankToken;
+  }
+
   if (
     element.matches(SUBQUESTION_SELECTOR) ||
-    element.matches("input, textarea, select")
+    element.matches("input, textarea")
   ) {
+    // Multi-blank subquestion groups (e.g. several related answers in one
+    // problem). Number every blank [1], [2], ... in document order so the
+    // whole passage can be solved jointly in one request.
+    if (options.blankCounter) {
+      options.blankCounter.value += 1;
+      return ` [${options.blankCounter.value}] `;
+    }
     return blankToken;
   }
 
@@ -207,6 +232,16 @@ function ensureStyles() {
       border-color: rgba(190, 24, 93, 0.16);
     }
 
+    .${HINT_PANEL_CLASS}[data-state="manual"] {
+      background: linear-gradient(180deg, #f8fafc 0%, #ffffff 100%);
+      border-color: rgba(15, 23, 42, 0.1);
+    }
+
+    .${HINT_PANEL_CLASS}[data-state="manual"] .moodle-hint-answer {
+      color: #64748b;
+      font-weight: 600;
+    }
+
     .moodle-hint-header {
       display: flex;
       align-items: center;
@@ -257,7 +292,8 @@ function ensureStyles() {
       justify-content: flex-end;
     }
 
-    .${HINT_PANEL_CLASS}[data-state="error"] .moodle-hint-actions {
+    .${HINT_PANEL_CLASS}[data-state="error"] .moodle-hint-actions,
+    .${HINT_PANEL_CLASS}[data-state="manual"] .moodle-hint-actions {
       display: flex;
     }
 
@@ -538,6 +574,43 @@ function extractQuestionText(questionRoot) {
   return normalizeText(renderNodeText(formulation));
 }
 
+function isFormControlFilled(element) {
+  if (!element) {
+    return false;
+  }
+
+  if (element.tagName === "SELECT") {
+    return Boolean(normalizeText(element.value));
+  }
+
+  if (element.type === "checkbox" || element.type === "radio") {
+    return Boolean(element.checked);
+  }
+
+  return Boolean(normalizeText(element.value));
+}
+
+function anyFormControlFilled(elements) {
+  return (elements || []).some((element) => isFormControlFilled(element));
+}
+
+function answerRootHasExistingAnswer(questionRoot) {
+  const answerRoot = questionRoot.querySelector(".answer");
+  if (!answerRoot) {
+    return false;
+  }
+
+  // Moodle checkbox groups pair each visible checkbox with a hidden input
+  // carrying the "unchecked" fallback value (e.g. value="0"). That hidden
+  // input always has a non-empty value, so it must be excluded here or
+  // every checkbox question would look "already answered".
+  return anyFormControlFilled(
+    Array.from(
+      answerRoot.querySelectorAll("input:not([type='hidden']), textarea, select")
+    )
+  );
+}
+
 function extractOptions(questionRoot) {
   const answerRoot = questionRoot.querySelector(".answer");
   if (!answerRoot) {
@@ -596,6 +669,44 @@ function getPromptContainer(subquestion) {
   );
 }
 
+// Walks `root`'s children in document order, collecting rendered text for
+// every node that comes strictly BEFORE `targetNode`. When a child contains
+// the target (e.g. a <ul> wrapping several <li> blanks), it recurses into
+// that child instead of skipping it wholesale, so earlier siblings inside
+// the same wrapper (e.g. an earlier <li> in the same list) are still
+// captured — then stops, since nothing after that ancestor at this level
+// can precede the target. Returns true once the target has been reached.
+function collectTextBeforeNode(root, targetNode, collector) {
+  for (const child of Array.from(root.children)) {
+    if (child === targetNode) {
+      return true;
+    }
+
+    if (
+      child.matches?.(".moodle-hint-anchor") ||
+      child.matches?.(`#${STATUS_WIDGET_ID}`)
+    ) {
+      continue;
+    }
+
+    if (child.contains(targetNode)) {
+      collectTextBeforeNode(child, targetNode, collector);
+      return true;
+    }
+
+    // Other blanks (e.g. a sibling <li> in the same list) render as a
+    // neutral placeholder, not the [blank] marker reserved for the target.
+    const text = normalizeText(
+      renderNodeText(child, { blankToken: " ___ " })
+    );
+    if (text) {
+      collector.push(text);
+    }
+  }
+
+  return false;
+}
+
 function extractPromptContext(questionRoot, promptContainer) {
   const formulation =
     questionRoot.matches(".formulation")
@@ -607,28 +718,7 @@ function extractPromptContext(questionRoot, promptContainer) {
   }
 
   const contextParts = [];
-  for (const child of Array.from(formulation.children)) {
-    if (child === promptContainer) {
-      break;
-    }
-
-    if (
-      child.matches?.(".moodle-hint-anchor") ||
-      child.matches?.(`#${STATUS_WIDGET_ID}`)
-    ) {
-      continue;
-    }
-
-    if (child.querySelector?.(SUBQUESTION_SELECTOR)) {
-      continue;
-    }
-
-    const text = normalizeText(renderNodeText(child));
-    if (text) {
-      contextParts.push(text);
-    }
-  }
-
+  collectTextBeforeNode(formulation, promptContainer, contextParts);
   return contextParts.join("\n");
 }
 
@@ -676,10 +766,39 @@ function extractTextAroundSubquestion(promptContainer, subquestion) {
   };
 }
 
-function inferSubquestionFieldInfo(promptContainer, subquestion, index) {
+function guessBlankVariableName(before) {
+  const normalized = normalizeText(before);
+
+  // Physics/formula style: "I1 = [blank] A" — pull out the "I1".
+  const equalsMatch = normalized.match(/([A-Za-z][A-Za-z0-9_]{0,6})\s*=\s*$/);
+  if (equalsMatch) {
+    return equalsMatch[1];
+  }
+
+  // Label style: "元素名1 : [blank]" / "...を表す単位の記号 : [blank]" — use
+  // the label text itself so the model gets a real anchor instead of a
+  // generic "Blank N"/"Symbol" name that can't distinguish repeated blanks.
+  // The label may span multiple sibling nodes (e.g. <strong>...</strong>
+  // followed by a plain text node), so allow internal spaces — just not
+  // another colon, which would pull in an unrelated earlier clause.
+  const colonMatch = normalized.match(/([^:：]{1,40})\s*[:：]\s*$/);
+  if (colonMatch) {
+    return normalizeText(colonMatch[1]);
+  }
+
+  return "";
+}
+
+function inferSubquestionFieldInfo(questionRoot, promptContainer, subquestion, index) {
   const { before, after } = extractTextAroundSubquestion(promptContainer, subquestion);
-  const beforeCompact = before.toLowerCase().replace(/\s+/g, "");
+  // The instruction that determines symbol/katakana requirements (e.g.
+  // "カタカナで...答えよ") often sits in an earlier paragraph outside this
+  // blank's own <li>, not in its immediate before/after text — pull in the
+  // broader (correctly document-ordered) preceding context too.
+  const broaderContext = extractPromptContext(questionRoot, promptContainer);
+  const beforeCompact = `${broaderContext} ${before}`.toLowerCase().replace(/\s+/g, "");
   const afterCompact = after.toLowerCase().replace(/\s+/g, "");
+  const variableName = guessBlankVariableName(before);
 
   const symbolKeywords = [
     /symbol/i,
@@ -700,16 +819,17 @@ function inferSubquestionFieldInfo(promptContainer, subquestion, index) {
   const afterHasName = nameKeywords.some((pattern) => pattern.test(afterCompact));
 
   if (beforeHasSymbol || afterHasSymbol) {
-    return { type: "symbol", label: "Symbol" };
+    return { type: "symbol", label: "Symbol", variableName };
   }
 
   if (beforeHasName || afterHasName) {
-    return { type: "name", label: "Name" };
+    return { type: "name", label: "Name", variableName };
   }
 
   return {
     type: "blank",
     label: `Blank ${index}`,
+    variableName,
   };
 }
 
@@ -736,8 +856,9 @@ function getSubquestionLabel(questionRoot, promptText, index, fieldInfo) {
 
 function extractSubquestions() {
   const countsByRoot = new Map();
+  const blanksByRoot = new Map();
 
-  return Array.from(document.querySelectorAll(SUBQUESTION_SELECTOR))
+  const blanks = Array.from(document.querySelectorAll(SUBQUESTION_SELECTOR))
     .map((subquestion) => {
       const questionRoot = getOwningQuestionRoot(subquestion);
       if (!questionRoot) {
@@ -749,6 +870,7 @@ function extractSubquestions() {
 
       const promptContainer = getPromptContainer(subquestion);
       const fieldInfo = inferSubquestionFieldInfo(
+        questionRoot,
         promptContainer,
         subquestion,
         nextIndex
@@ -758,14 +880,16 @@ function extractSubquestions() {
         return null;
       }
 
-      const inputElement = subquestion.querySelector("input, textarea, select");
+      const inputElement = subquestion.querySelector(
+        "input:not([type='hidden']), textarea, select"
+      );
       const uniqueId =
         inputElement?.id ||
         inputElement?.name ||
         `${getQuestionLabel(questionRoot)}-${nextIndex}`;
       const options = extractSubquestionOptions(subquestion);
 
-      return {
+      const blank = {
         key: buildQuestionKey(questionText, options, uniqueId),
         label: getSubquestionLabel(
           questionRoot,
@@ -781,9 +905,78 @@ function extractSubquestions() {
         fieldLabel: fieldInfo.label,
         requestKey: uniqueId,
         uniqueId,
+        inputElement,
+        variableName: fieldInfo.variableName || "",
+        hasExistingAnswer: isFormControlFilled(inputElement),
       };
+
+      const siblingList = blanksByRoot.get(questionRoot) || [];
+      siblingList.push(blank);
+      blanksByRoot.set(questionRoot, siblingList);
+
+      return blank;
     })
     .filter(Boolean);
+
+  // When a question root has several related free-text blanks (e.g. a
+  // multi-part physics problem with I, I1, I2, V3...), solve them jointly in
+  // one request instead of one isolated request per blank. Isolated requests
+  // can't stay consistent with each other (e.g. re-deriving a different
+  // circuit topology for each current, or forgetting a later part builds on
+  // an earlier one).
+  for (const [questionRoot, group] of blanksByRoot) {
+    if (group.length < 2 || group.some((blank) => blank.options.length)) {
+      // Groups with dropdown options (e.g. matching-type subquestions) keep
+      // using the existing independent per-blank flow.
+      continue;
+    }
+
+    const formulation = questionRoot.matches(".formulation")
+      ? questionRoot
+      : questionRoot.querySelector(".formulation");
+    if (!formulation) {
+      continue;
+    }
+
+    const markedText = buildMultiBlankMarkedText(formulation);
+    if (!markedText) {
+      continue;
+    }
+
+    // Prefer a real anchor like "I1" over a generic "Blank 2" so the model
+    // has an explicit index-to-quantity mapping, not just the passage text.
+    const nameCounts = new Map();
+    for (const blank of group) {
+      const name = blank.variableName || blank.label;
+      nameCounts.set(name, (nameCounts.get(name) || 0) + 1);
+    }
+    const nameOccurrence = new Map();
+    const groupBlanks = group.map((blank) => {
+      const baseName = blank.variableName || blank.label;
+      let label = baseName;
+      if (nameCounts.get(baseName) > 1) {
+        // Disambiguate repeated names (e.g. "I" asked again in a later part).
+        const occurrence = (nameOccurrence.get(baseName) || 0) + 1;
+        nameOccurrence.set(baseName, occurrence);
+        label = `${baseName} (occurrence ${occurrence} of ${nameCounts.get(baseName)})`;
+      }
+      return { label, fieldType: blank.targetType };
+    });
+    const groupRequestKey = `${group[0].uniqueId}-group`;
+    // These are solved together in one request, so if any sibling already
+    // has an answer, treat the whole group as already attempted.
+    const groupHasExistingAnswer = group.some((blank) => blank.hasExistingAnswer);
+
+    group.forEach((blank, index) => {
+      blank.groupMarkedText = markedText;
+      blank.groupIndex = index;
+      blank.groupBlanks = groupBlanks;
+      blank.groupRequestKey = groupRequestKey;
+      blank.hasExistingAnswer = groupHasExistingAnswer;
+    });
+  }
+
+  return blanks;
 }
 
 function getImageContainer(questionRoot) {
@@ -891,11 +1084,24 @@ async function attachQuestionImages(questions) {
     questions.map(async (question) => {
       const container = getImageContainer(question.questionRoot);
       question.images = await extractQuestionImages(container);
+      const imageUrls = question.images.map((image) => image.url);
+
+      if (question.targetType === "gapfill") {
+        question.key =
+          buildQuestionKey(
+            question.questionText,
+            [],
+            question.uniqueId || "",
+            imageUrls
+          ) + "#gapfill";
+        return;
+      }
+
       question.key = buildQuestionKey(
         question.questionText,
         question.options,
         question.uniqueId || "",
-        question.images.map((image) => image.url)
+        imageUrls
       );
     })
   );
@@ -903,39 +1109,113 @@ async function attachQuestionImages(questions) {
   return questions;
 }
 
+// Inline dropdowns (Moodle "gapselect") live directly inside .qtext, not inside
+// a .subquestion wrapper. Each <select> is one blank sharing the same sentence.
+function getInlineSelects(container) {
+  if (!container) {
+    return [];
+  }
+
+  return Array.from(container.querySelectorAll("select")).filter(
+    (select) => !select.closest(SUBQUESTION_SELECTOR)
+  );
+}
+
+function extractSelectOptions(select) {
+  return Array.from(select.options)
+    .map((option) => normalizeText(option.textContent || option.innerText || ""))
+    .filter((optionText) => optionText && optionText !== "-");
+}
+
+// The whole sentence with every blank numbered [1], [2], ... so the model can
+// reason about all blanks together in a single request.
+function buildGapfillMarkedText(container) {
+  return normalizeText(
+    renderNodeText(container, { selectCounter: { value: 0 } })
+  );
+}
+
+// The whole passage with every free-text blank numbered [1], [2], ... in
+// document order, so a multi-part problem (e.g. several related physics
+// answers) can be solved jointly with shared, consistent reasoning instead
+// of re-deriving each value from scratch in an isolated request.
+function buildMultiBlankMarkedText(formulation) {
+  return normalizeText(
+    renderNodeText(formulation, { blankCounter: { value: 0 } })
+  );
+}
+
+function buildGapfillBlanks(selects) {
+  return selects.map((select, index) => ({
+    label: `空白${index + 1}`,
+    options: extractSelectOptions(select),
+  }));
+}
+
 async function extractQuestions() {
-  const standardQuestions = getQuestionRoots()
-    .map((questionRoot) => {
-      if (questionRoot.querySelector(SUBQUESTION_SELECTOR)) {
-        return null;
-      }
+  const gapfillQuestions = [];
+  const standardQuestions = [];
 
-      const questionText = extractQuestionText(questionRoot);
-      if (!questionText) {
-        return null;
-      }
+  for (const questionRoot of getQuestionRoots()) {
+    if (questionRoot.querySelector(SUBQUESTION_SELECTOR)) {
+      continue;
+    }
 
-      const options = extractOptions(questionRoot);
-      const uniqueId = questionRoot.id || "";
-      return {
-        key: buildQuestionKey(questionText, options, uniqueId),
+    const uniqueId = questionRoot.id || "";
+    const container = getImageContainer(questionRoot);
+    const inlineSelects = getInlineSelects(container);
+
+    if (inlineSelects.length) {
+      const baseText = extractQuestionText(questionRoot);
+      gapfillQuestions.push({
+        key: buildQuestionKey(baseText, [], uniqueId) + "#gapfill",
         label: getQuestionLabel(questionRoot),
         questionRoot,
-        questionText,
-        options,
-        targetType: "standard",
-        requestKey: questionRoot.id || questionText,
+        questionText: baseText,
+        markedText: buildGapfillMarkedText(container),
+        options: [],
+        targetType: "gapfill",
+        requestKey: uniqueId || baseText,
         uniqueId,
+        blanks: buildGapfillBlanks(inlineSelects),
+        hasExistingAnswer: anyFormControlFilled(inlineSelects),
         anchorElement:
           questionRoot.querySelector(".formulation") ||
           questionRoot.querySelector(".content") ||
           questionRoot,
-      };
-    })
-    .filter(Boolean);
+      });
+      continue;
+    }
+
+    const questionText = extractQuestionText(questionRoot);
+    if (!questionText) {
+      continue;
+    }
+
+    const options = extractOptions(questionRoot);
+    standardQuestions.push({
+      key: buildQuestionKey(questionText, options, uniqueId),
+      label: getQuestionLabel(questionRoot),
+      questionRoot,
+      questionText,
+      options,
+      targetType: "standard",
+      requestKey: questionRoot.id || questionText,
+      uniqueId,
+      hasExistingAnswer: answerRootHasExistingAnswer(questionRoot),
+      anchorElement:
+        questionRoot.querySelector(".formulation") ||
+        questionRoot.querySelector(".content") ||
+        questionRoot,
+    });
+  }
 
   const subquestions = extractSubquestions();
-  const questions = [...standardQuestions, ...subquestions];
+  const questions = [
+    ...standardQuestions,
+    ...gapfillQuestions,
+    ...subquestions,
+  ];
   await attachQuestionImages(questions);
   return questions;
 }
@@ -951,11 +1231,26 @@ function ensurePanel(question) {
   const anchor = document.createElement("div");
   anchor.className = "moodle-hint-anchor";
 
+  const isAlreadyAnswered = Boolean(question.hasExistingAnswer);
+
   const panel = document.createElement("aside");
   panel.className = HINT_PANEL_CLASS;
-  panel.dataset.state = "idle";
+  panel.dataset.state = isAlreadyAnswered ? "manual" : "idle";
   panel.dataset.questionKey = question.key;
-  panel.innerHTML = `
+  panel.innerHTML = isAlreadyAnswered
+    ? `
+    <div class="moodle-hint-header">
+      <div class="moodle-hint-title">${question.label} Hint</div>
+      <div class="moodle-hint-status">Skipped</div>
+    </div>
+    <div class="moodle-hint-answer">Already answered — hint not generated.</div>
+    <div class="moodle-hint-reason"></div>
+    <div class="moodle-hint-meta"></div>
+    <div class="moodle-hint-actions">
+      <button class="moodle-hint-retry" type="button">Generate hint</button>
+    </div>
+  `
+    : `
     <div class="moodle-hint-header">
       <div class="moodle-hint-title">${question.label} Hint</div>
       <div class="moodle-hint-status">Queued</div>
@@ -1023,9 +1318,16 @@ function updatePanel(panel, payload) {
   panel.querySelector(".moodle-hint-answer").textContent = payload.answer;
   panel.querySelector(".moodle-hint-reason").textContent = payload.reason || "";
   panel.querySelector(".moodle-hint-meta").textContent = payload.meta || "";
+
+  const retryButton = panel.querySelector(".moodle-hint-retry");
+  if (retryButton) {
+    retryButton.textContent = payload.state === "manual" ? "Generate hint" : "Retry";
+  }
 }
 
 function retryHint(question, panel) {
+  const isFirstGeneration = panel.dataset.state === "manual";
+
   loadSettings().then((settings) => {
     if (isPaused(settings)) {
       updatePanel(panel, {
@@ -1047,8 +1349,8 @@ function retryHint(question, panel) {
 
     updatePanel(panel, {
       state: "loading",
-      status: "Retrying...",
-      answer: "Retrying hint...",
+      status: isFirstGeneration ? "Loading..." : "Retrying...",
+      answer: isFirstGeneration ? "Generating hint..." : "Retrying hint...",
       reason: "",
       meta: "",
     });
@@ -1122,6 +1424,9 @@ function parseAnswerText(answerPayload) {
   const providerName = normalizeText(
     typeof answerPayload === "object" ? answerPayload?.provider || "" : ""
   );
+  const expression = normalizeText(
+    typeof answerPayload === "object" ? answerPayload?.expression || "" : ""
+  );
 
   const answer = String(answerText || "")
     .split(/\r?\n/)
@@ -1136,9 +1441,11 @@ function parseAnswerText(answerPayload) {
     };
   }
 
+  // Fallback events (a provider failing over to the next) are logged in the
+  // popup's Logs panel instead of cluttering every hint with them.
   return {
     answer,
-    reason: "",
+    reason: expression ? `式: ${expression}` : "",
     meta:
       modelName && providerName
         ? `Provider: ${providerName} | Model: ${modelName}`
@@ -1198,6 +1505,8 @@ function requestAnswer(question) {
           answer,
           model: normalizeText(response?.model || ""),
           provider: normalizeText(response?.provider || ""),
+          expression: normalizeText(response?.expression || ""),
+          fallbackNote: normalizeText(response?.fallbackNote || ""),
         };
 
         answerCache.set(cacheKey, result);
@@ -1263,6 +1572,198 @@ function runQueue() {
   }
 }
 
+function requestGapfillAnswer(question) {
+  const cacheKey = getRequestCacheKey(question);
+
+  if (answerCache.has(cacheKey)) {
+    return Promise.resolve(answerCache.get(cacheKey));
+  }
+
+  if (pendingAnswers.has(cacheKey)) {
+    return pendingAnswers.get(cacheKey);
+  }
+
+  const promise = new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage(
+      {
+        action: "getAnswer",
+        question: question.markedText,
+        blanks: question.blanks.map((blank) => ({
+          label: blank.label,
+          options: blank.options,
+        })),
+        images: (question.images || []).map((image) => image.dataUrl),
+        requestKey: question.requestKey || question.key,
+        targetType: "gapfill",
+        detailedMode: Boolean(currentSettings.detailedMode),
+        materialMode: Boolean(currentSettings.materialMode),
+        materialRevision: Number(currentSettings.materialRevision) || 0,
+      },
+      (response) => {
+        const runtimeError = chrome.runtime.lastError;
+        if (runtimeError) {
+          reject(new Error(runtimeError.message));
+          return;
+        }
+
+        const responseError = normalizeText(response?.error || "");
+        if (responseError) {
+          reject(new Error(responseError));
+          return;
+        }
+
+        const answers = Array.isArray(response?.answers) ? response.answers : [];
+        if (!answers.length) {
+          reject(new Error("No answer found."));
+          return;
+        }
+
+        const result = {
+          answers,
+          model: normalizeText(response?.model || ""),
+          provider: normalizeText(response?.provider || ""),
+          fallbackNote: normalizeText(response?.fallbackNote || ""),
+        };
+
+        answerCache.set(cacheKey, result);
+        resolve(result);
+      }
+    );
+  }).finally(() => {
+    pendingAnswers.delete(cacheKey);
+  });
+
+  pendingAnswers.set(cacheKey, promise);
+  return promise;
+}
+
+async function resolveGapfillAnswers(question) {
+  const result = await requestGapfillAnswer(question);
+  const lines = result.answers.map(
+    (item, index) =>
+      `${normalizeText(item?.label) || `空白${index + 1}`}: ${
+        normalizeText(item?.answer) || "(不明)"
+      }`
+  );
+
+  const model = normalizeText(result.model || "");
+  const provider = normalizeText(result.provider || "");
+  const meta =
+    model && provider
+      ? `Provider: ${provider} | Model: ${model}`
+      : model
+        ? `Model: ${model}`
+        : provider
+          ? `Provider: ${provider}`
+          : "";
+
+  return {
+    answer: lines.join("\n"),
+    reason: "",
+    meta,
+  };
+}
+
+function getGroupRequestCacheKey(question, settings = currentSettings) {
+  return JSON.stringify({
+    groupKey: question.groupRequestKey || question.groupMarkedText,
+    markedText: question.groupMarkedText,
+    detailedMode: Boolean(settings.detailedMode),
+    materialMode: Boolean(settings.materialMode),
+    freeApiMode: Boolean(settings.freeApiMode),
+    materialRevision: Number(settings.materialRevision) || 0,
+    imageUrls: (question.images || []).map((image) => image.url),
+  });
+}
+
+function requestGroupBlankAnswers(question) {
+  const cacheKey = getGroupRequestCacheKey(question);
+
+  if (answerCache.has(cacheKey)) {
+    return Promise.resolve(answerCache.get(cacheKey));
+  }
+
+  if (pendingAnswers.has(cacheKey)) {
+    return pendingAnswers.get(cacheKey);
+  }
+
+  const promise = new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage(
+      {
+        action: "getAnswer",
+        question: question.groupMarkedText,
+        blanks: question.groupBlanks,
+        images: (question.images || []).map((image) => image.dataUrl),
+        requestKey: question.groupRequestKey || question.requestKey || question.key,
+        targetType: "multiblank",
+        detailedMode: Boolean(currentSettings.detailedMode),
+        materialMode: Boolean(currentSettings.materialMode),
+        materialRevision: Number(currentSettings.materialRevision) || 0,
+      },
+      (response) => {
+        const runtimeError = chrome.runtime.lastError;
+        if (runtimeError) {
+          reject(new Error(runtimeError.message));
+          return;
+        }
+
+        const responseError = normalizeText(response?.error || "");
+        if (responseError) {
+          reject(new Error(responseError));
+          return;
+        }
+
+        const answers = Array.isArray(response?.answers) ? response.answers : [];
+        if (!answers.length) {
+          reject(new Error("No answer found."));
+          return;
+        }
+
+        const result = {
+          answers,
+          model: normalizeText(response?.model || ""),
+          provider: normalizeText(response?.provider || ""),
+          fallbackNote: normalizeText(response?.fallbackNote || ""),
+        };
+
+        answerCache.set(cacheKey, result);
+        resolve(result);
+      }
+    );
+  }).finally(() => {
+    pendingAnswers.delete(cacheKey);
+  });
+
+  pendingAnswers.set(cacheKey, promise);
+  return promise;
+}
+
+async function resolveGroupBlankAnswer(question) {
+  const result = await requestGroupBlankAnswers(question);
+  const item = result.answers[question.groupIndex];
+  const answer = normalizeText(item?.answer || "");
+  if (!answer) {
+    throw new Error("No answer found for this blank.");
+  }
+
+  const expression = normalizeText(item?.expression || "");
+  const model = normalizeText(result.model || "");
+  const provider = normalizeText(result.provider || "");
+
+  return {
+    answer,
+    reason: expression ? `式: ${expression}` : "",
+    meta:
+      model && provider
+        ? `Provider: ${provider} | Model: ${model}`
+        : model
+          ? `Model: ${model}`
+          : provider
+            ? `Provider: ${provider}`
+            : "",
+  };
+}
+
 async function hydratePanel(question, panel, options = {}) {
   const force = Boolean(options.force);
   const settings = await loadSettings();
@@ -1292,8 +1793,14 @@ async function hydratePanel(question, panel, options = {}) {
       meta: "",
     });
 
-    const answerResult = await requestAnswer(question);
-    const parsed = parseAnswerText(answerResult);
+    let parsed;
+    if (question.blanks && question.blanks.length) {
+      parsed = await resolveGapfillAnswers(question);
+    } else if (question.groupMarkedText) {
+      parsed = await resolveGroupBlankAnswer(question);
+    } else {
+      parsed = parseAnswerText(await requestAnswer(question));
+    }
 
     panel.dataset.loadedKey = loadKey;
     runtimeState.readyCount += 1;
@@ -1393,6 +1900,13 @@ async function processQuestions() {
 
   for (const question of questions) {
     const panel = ensurePanel(question);
+
+    // Left as "manual" on creation because the field already had an answer;
+    // never auto-fetch it, only via its own "Generate hint" button.
+    if (panel.dataset.state === "manual") {
+      continue;
+    }
+
     const loadKey = getRequestCacheKey(question, settings);
 
     if (
@@ -1518,36 +2032,44 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   }
 });
 
+const QUESTION_CONTENT_SELECTOR =
+  ".que, .qtext, .formulation, .subquestion, .answer, select, textarea";
+
+// Only a node that adds/removes real question content should trigger a rescan.
+// This ignores the quiz timer, autosave markers, tooltips, and our own panels,
+// which otherwise mutate constantly and cause the same question to be re-solved.
+function isQuestionRelevantNode(node) {
+  if (!(node instanceof Element)) {
+    return false;
+  }
+
+  if (
+    node.closest(".moodle-hint-anchor") ||
+    node.closest(`#${STATUS_WIDGET_ID}`)
+  ) {
+    return false;
+  }
+
+  return (
+    node.matches(QUESTION_CONTENT_SELECTOR) ||
+    Boolean(node.querySelector?.(QUESTION_CONTENT_SELECTOR))
+  );
+}
+
 const observer = new MutationObserver((mutations) => {
   const shouldScan = mutations.some((mutation) => {
-    if (!(mutation.target instanceof Element)) {
-      return true;
-    }
-
     if (
-      mutation.target.closest(".moodle-hint-anchor") ||
-      mutation.target.closest(`#${STATUS_WIDGET_ID}`)
+      mutation.target instanceof Element &&
+      (mutation.target.closest(".moodle-hint-anchor") ||
+        mutation.target.closest(`#${STATUS_WIDGET_ID}`))
     ) {
       return false;
     }
 
-    const relevantAddedNode = Array.from(mutation.addedNodes).some((node) => {
-      return (
-        !(node instanceof Element) ||
-        (!node.closest(".moodle-hint-anchor") &&
-          !node.closest(`#${STATUS_WIDGET_ID}`))
-      );
-    });
-
-    const relevantRemovedNode = Array.from(mutation.removedNodes).some((node) => {
-      return (
-        !(node instanceof Element) ||
-        (!node.closest(".moodle-hint-anchor") &&
-          !node.closest(`#${STATUS_WIDGET_ID}`))
-      );
-    });
-
-    return relevantAddedNode || relevantRemovedNode;
+    return (
+      Array.from(mutation.addedNodes).some(isQuestionRelevantNode) ||
+      Array.from(mutation.removedNodes).some(isQuestionRelevantNode)
+    );
   });
 
   if (shouldScan) {

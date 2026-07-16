@@ -39,6 +39,15 @@ const OPENROUTER_GEMINI_DETAILED_MODEL_IDS = [
   "google/gemini-2.5-flash",
   "google/gemini-2.5-flash-lite",
 ];
+// flash-lite's vision is noticeably weaker than flash's (e.g. misreading
+// circuit diagrams). When a question has attached images and we're on a
+// paid chain (not the free OpenRouter models), prefer flash first.
+const OPENROUTER_GEMINI_IMAGE_MODEL_IDS = [
+  "google/gemini-2.5-flash",
+  "google/gemini-2.5-flash-lite",
+  "google/gemini-2.0-flash-001",
+  "google/gemini-2.0-flash-lite-001",
+];
 const OPENROUTER_FREE_STANDARD_MODEL_IDS = [
   "qwen/qwen3-coder:free",
   "deepseek/deepseek-v4-flash:free",
@@ -62,13 +71,18 @@ const GEMINI_DETAILED_MODEL_IDS = [
   "gemini-2.5-flash",
   "gemini-2.5-flash-lite",
 ];
+const GEMINI_IMAGE_MODEL_IDS = ["gemini-2.5-flash", "gemini-2.5-flash-lite"];
 const CAPI_STANDARD_MODEL_IDS = ["gpt-4o-2024-11-20", "gpt-4o", "gpt-4.1"];
 const CAPI_MATERIAL_ACCURACY_MODEL_IDS = [
   "gpt-4o-2024-11-20",
   "gpt-4.1",
   "gemini-2.5-flash",
 ];
-const DEFAULT_PROVIDER_ORDER = [PROVIDER_OPENROUTER, PROVIDER_GEMINI];
+// Gemini's native API has a genuinely free tier, so it's the more sensible
+// default to try first; OpenRouter (paid) kicks in once that free quota is
+// exhausted. Users who already saved a custom order in the popup are
+// unaffected — this only applies to fresh installs.
+const DEFAULT_PROVIDER_ORDER = [PROVIDER_GEMINI, PROVIDER_OPENROUTER];
 const MATERIAL_CONTEXT_MAX_CHARS = 120000;
 const MATERIAL_REFERENCE_MAX_CHARS = 9000;
 const MATERIAL_CHUNK_MAX_CHARS = 1400;
@@ -103,7 +117,8 @@ const SYSTEM_PROMPT =
   "You solve Moodle quiz questions. " +
   "Never greet, chat casually, mention being an assistant, or ask follow-up questions. " +
   "When the question is in Japanese, answer in Japanese. " +
-  "Return only the final answer on one line.";
+  "Follow the exact output format described in the question's instructions. " +
+  "Return only the final answer on one line, with no extra words, labels, or punctuation around it.";
 
 const INVALID_ANSWER_PATTERNS = [
   /\bhello\b/i,
@@ -119,7 +134,7 @@ const INVALID_ANSWER_PATTERNS = [
 ];
 
 const NUMBER_QUESTION_PATTERN =
-  /(?:\u4F55\u500B|\u3044\u304F\u3064|\u4F55\u4EBA|\u4F55\u56DE|\u4F55\u672C|\u4F55\u679A|\u4F55\u6B73|\u4F55\u70B9|\u4F55%|\u4F55\u30D1\u30FC\u30BB\u30F3\u30C8|\u4F55\u4E57|\u6307\u6570|\[blank\]\s*\u4E57|\u4E57\u3067\u3042\u308B|how many|how much|number of|count|exponent|power)/i;
+  /(?:\u4F55\u500B|\u3044\u304F\u3064|\u4F55\u4EBA|\u4F55\u56DE|\u4F55\u672C|\u4F55\u679A|\u4F55\u6B73|\u4F55\u70B9|\u4F55%|\u4F55\u30D1\u30FC\u30BB\u30F3\u30C8|\u4F55\u4E57|\u6307\u6570|\[blank\]\s*\u4E57|\u4E57\u3067\u3042\u308B|\u6C42\u3081\u3088|\u6C42\u3081\u306A\u3055\u3044|\u8A08\u7B97\u305B\u3088|\u8A08\u7B97\u3057\u306A\u3055\u3044|\u5408\u6210\u62B5\u6297|\u5408\u6210\u96FB\u5727|\u5408\u6210\u96FB\u6D41|\u5408\u6210\u9759\u96FB\u5BB9\u91CF|\u5408\u6210\u5BB9\u91CF|\u306E\u5024(?:\u306F|\u3092)|\u4F55[A-Za-z\u03A9\u03BC\u00B0]|\u4F55(?:\u30DC\u30EB\u30C8|\u30A2\u30F3\u30DA\u30A2|\u30AA\u30FC\u30E0|\u30EF\u30C3\u30C8|\u30D8\u30EB\u30C4|\u30B8\u30E5\u30FC\u30EB|\u30CB\u30E5\u30FC\u30C8\u30F3|\u30D1\u30B9\u30AB\u30EB|\u30B1\u30EB\u30D3\u30F3)|how many|how much|number of|count|exponent|power|calculate|compute)/i;
 const SYMBOL_ANSWER_PATTERN =
   /^(?:[A-Za-z\u00B5\u03BC\u0370-\u03FF]{1,4}|(?:<=|>=|!=|==|->|=>|[<>\u007C\u2264\u2265=\u2260\u2248~+\-\u2212*\u00D7\u00F7\/\u00B1%\u2030\u00B0^\u221A\u221E\u2211\u222B\u2202\u2206\u0394]){1,8})$/u;
 const SYMBOL_OPERATOR_PATTERN =
@@ -519,6 +534,14 @@ function getModelChain(
 ) {
   if (providerId === PROVIDER_OPENROUTER) {
     const useDetailedProfile = Boolean(modelPolicy?.detailedMode);
+    const freeApiMode = Boolean(modelPolicy?.freeApiMode);
+    // Only escalate past flash-lite on the paid chain — the free OpenRouter
+    // models are unaffected by image content.
+    const useImageProfile =
+      Boolean(modelPolicy?.hasImages) &&
+      !useDetailedProfile &&
+      !useAccuracyProfile &&
+      !freeApiMode;
     const freeModels = useAccuracyProfile
       ? dedupeModels(OPENROUTER_FREE_MATERIAL_ACCURACY_MODEL_IDS)
       : dedupeModels(OPENROUTER_FREE_STANDARD_MODEL_IDS);
@@ -526,8 +549,9 @@ function getModelChain(
       ? dedupeModels(OPENROUTER_GEMINI_DETAILED_MODEL_IDS)
       : useAccuracyProfile
       ? dedupeModels(OPENROUTER_GEMINI_MATERIAL_ACCURACY_MODEL_IDS)
+      : useImageProfile
+      ? dedupeModels(OPENROUTER_GEMINI_IMAGE_MODEL_IDS)
       : dedupeModels(OPENROUTER_GEMINI_STANDARD_MODEL_IDS);
-    const freeApiMode = Boolean(modelPolicy?.freeApiMode);
     const mode =
       normalizeText(modelPolicy?.openRouterBudgetMode).toLowerCase() ||
       "free_then_paid";
@@ -554,9 +578,15 @@ function getModelChain(
       return dedupeModels(GEMINI_DETAILED_MODEL_IDS);
     }
 
-    return useAccuracyProfile
-      ? dedupeModels(GEMINI_MATERIAL_ACCURACY_MODEL_IDS)
-      : dedupeModels(GEMINI_STANDARD_MODEL_IDS);
+    if (useAccuracyProfile) {
+      return dedupeModels(GEMINI_MATERIAL_ACCURACY_MODEL_IDS);
+    }
+
+    if (modelPolicy?.hasImages) {
+      return dedupeModels(GEMINI_IMAGE_MODEL_IDS);
+    }
+
+    return dedupeModels(GEMINI_STANDARD_MODEL_IDS);
   }
 
   return useAccuracyProfile
@@ -856,8 +886,11 @@ function buildQuizPrompt(
 
   if (question.includes("[blank]")) {
     instructions.push("The text contains one [blank] marker.");
-    instructions.push("Return only the exact content that should replace [blank].");
-    instructions.push("Do not rewrite the whole sentence or expression.");
+    instructions.push("Return only the exact word(s) that replace [blank], nothing else.");
+    instructions.push("Do not rewrite or repeat the whole sentence or expression.");
+    instructions.push(
+      'Example: for "Tokyo is the capital of [blank]." the correct output is "Japan", not the full sentence.'
+    );
   }
 
   if (hasImages) {
@@ -878,17 +911,37 @@ function buildQuizPrompt(
   }
 
   if (answerMode === "choice") {
-    instructions.push("Choose exactly one answer from the list.");
-    instructions.push("Copy the chosen option text exactly.");
+    instructions.push(
+      "Choose exactly one answer from the Choices list below, copied character-for-character."
+    );
+    instructions.push(
+      "Do not add a number, letter, bullet, or punctuation before or after it, and do not paraphrase or shorten it."
+    );
   } else if (answerMode === "symbol") {
-    instructions.push("Return only the requested symbol.");
-    instructions.push("Use only the symbol itself, such as |, >, <, >=, <=, =, !=, +, -, f, p, n, u, m, c, d, da, h, k, M, G, T, P.");
+    instructions.push("Return only the single symbol or operator being asked for, nothing else.");
+    instructions.push(
+      "If it is a metric prefix, answer with just the prefix letters: f, p, n, u, m, c, d, da, h, k, M, G, T, or P."
+    );
+    instructions.push(
+      "If it is a comparison or math operator instead, answer with just the operator: <, >, <=, >=, =, !=, +, -, *, or /."
+    );
   } else if (answerMode === "name") {
-    instructions.push("Return only the requested name.");
+    instructions.push(
+      "Return only the requested name or term, with no extra words, particles, or punctuation around it."
+    );
     instructions.push("If the question asks for katakana, use katakana only.");
   } else if (answerMode === "number") {
     instructions.push("The answer should be a number.");
-    instructions.push("Output digits only.");
+    instructions.push(
+      "If arriving at this number requires ANY calculation (multiplication, unit conversion, exponent, etc.), do NOT compute the final value yourself. You are bad at arithmetic and will get it wrong."
+    );
+    instructions.push(
+      'In that case output only: EXPR: <expression> — a plain arithmetic expression using only +, -, *, /, ^, parentheses, and decimal or scientific-notation numbers. No units, no words, no "=", nothing else on the line.'
+    );
+    instructions.push("Example: EXPR: 3.3e-6 * 2 / (1 - 0.5)");
+    instructions.push(
+      "Only if the number is a simple lookup or count with no calculation at all, output digits only instead."
+    );
   } else {
     instructions.push("Output only the short final answer.");
   }
@@ -896,6 +949,10 @@ function buildQuizPrompt(
   if (compactMode) {
     instructions.push("Keep the answer as short as possible.");
   }
+
+  instructions.push(
+    "Final check: your entire output must be only the answer itself (or the EXPR line for calculations) — no restated question, no extra words."
+  );
 
   const optionsBlock = cleanedOptions.length
     ? cleanedOptions.join("\n")
@@ -960,14 +1017,16 @@ function buildRequestPlans(
         : hasMaterial
           ? 24
           : 12;
+  const numberExpressionBonus = answerMode === "number" ? 48 : 0;
   const safeMaxTokens = Math.max(
     16,
-    maxTokens,
+    maxTokens + numberExpressionBonus,
     hasImages ? IMAGE_QUESTION_MIN_TOKENS : 0
   );
   const effectiveModelPolicy = {
     ...modelPolicy,
     detailedMode: effectiveDetailedMode,
+    hasImages,
   };
 
   let providerModelPlans = buildProviderModelPlans(
@@ -1008,7 +1067,7 @@ function buildRequestPlans(
       ),
       maxTokens: safeMaxTokens,
       images,
-      allowThinking: effectiveDetailedMode || hasImages,
+      allowThinking: effectiveDetailedMode || hasImages || answerMode === "number",
     })),
     ...fallbackPlans.map((plan) => ({
       providerId: plan.providerId,
@@ -1024,7 +1083,7 @@ function buildRequestPlans(
       ),
       maxTokens: safeMaxTokens,
       images,
-      allowThinking: effectiveDetailedMode || hasImages,
+      allowThinking: effectiveDetailedMode || hasImages || answerMode === "number",
     })),
   ];
 }
@@ -1322,6 +1381,242 @@ function extractNameLikeAnswer(answer, question) {
   return katakanaMatch ? katakanaMatch[0] : cleaned;
 }
 
+// --- Safe arithmetic expression evaluator ---------------------------------
+// LLMs are unreliable at multi-step arithmetic (exponents, unit conversions).
+// For calculation-type answers we ask the model for the expression only and
+// compute the final value ourselves here, deterministically. No eval()/
+// Function() is used (also disallowed under MV3's extension CSP); this is a
+// small whitelisted recursive-descent parser instead.
+const MATH_FUNCTIONS = {
+  sqrt: Math.sqrt,
+  abs: Math.abs,
+  sin: Math.sin,
+  cos: Math.cos,
+  tan: Math.tan,
+  asin: Math.asin,
+  acos: Math.acos,
+  atan: Math.atan,
+  ln: Math.log,
+  log: Math.log10,
+  log10: Math.log10,
+  log2: Math.log2,
+  exp: Math.exp,
+};
+const MATH_CONSTANTS = {
+  pi: Math.PI,
+  e: Math.E,
+};
+const MATH_EXPRESSION_MAX_LENGTH = 200;
+
+function tokenizeMathExpression(expr) {
+  const pattern =
+    /([0-9]*\.?[0-9]+(?:[eE][+-]?[0-9]+)?)|([A-Za-z_][A-Za-z0-9_]*)|([()+\-*/^%,])|(\s+)/g;
+  const tokens = [];
+  let cursor = 0;
+  let match;
+
+  while ((match = pattern.exec(expr)) !== null) {
+    if (match.index !== cursor) {
+      throw new Error(`Unexpected character near "${expr.slice(cursor, match.index)}"`);
+    }
+    cursor = pattern.lastIndex;
+
+    if (match[4]) {
+      continue;
+    }
+    if (match[1] !== undefined) {
+      tokens.push({ type: "number", value: Number(match[1]) });
+    } else if (match[2] !== undefined) {
+      tokens.push({ type: "ident", value: match[2].toLowerCase() });
+    } else if (match[3] !== undefined) {
+      tokens.push({ type: "op", value: match[3] });
+    }
+  }
+
+  if (cursor !== expr.length) {
+    throw new Error("Unexpected trailing characters in expression.");
+  }
+
+  return tokens;
+}
+
+function parseMathExpressionTokens(tokens) {
+  let pos = 0;
+
+  const peek = () => tokens[pos];
+  const consume = (type, value) => {
+    const token = tokens[pos];
+    if (!token || token.type !== type || (value !== undefined && token.value !== value)) {
+      throw new Error("Invalid expression syntax.");
+    }
+    pos += 1;
+    return token;
+  };
+
+  function parseExpression() {
+    return parseAddSub();
+  }
+
+  function parseAddSub() {
+    let value = parseMulDiv();
+    while (peek()?.type === "op" && (peek().value === "+" || peek().value === "-")) {
+      const op = consume("op").value;
+      const right = parseMulDiv();
+      value = op === "+" ? value + right : value - right;
+    }
+    return value;
+  }
+
+  function parseMulDiv() {
+    let value = parseUnary();
+    while (
+      peek()?.type === "op" &&
+      (peek().value === "*" || peek().value === "/" || peek().value === "%")
+    ) {
+      const op = consume("op").value;
+      const right = parseUnary();
+      if (op === "*") value *= right;
+      else if (op === "/") value /= right;
+      else value %= right;
+    }
+    return value;
+  }
+
+  function parseUnary() {
+    if (peek()?.type === "op" && (peek().value === "-" || peek().value === "+")) {
+      const op = consume("op").value;
+      const value = parseUnary();
+      return op === "-" ? -value : value;
+    }
+    return parsePower();
+  }
+
+  function parsePower() {
+    const base = parsePrimary();
+    if (peek()?.type === "op" && peek().value === "^") {
+      consume("op", "^");
+      const exponent = parseUnary();
+      return Math.pow(base, exponent);
+    }
+    return base;
+  }
+
+  function parsePrimary() {
+    const token = peek();
+    if (!token) {
+      throw new Error("Unexpected end of expression.");
+    }
+
+    if (token.type === "number") {
+      consume("number");
+      return token.value;
+    }
+
+    if (token.type === "op" && token.value === "(") {
+      consume("op", "(");
+      const value = parseExpression();
+      consume("op", ")");
+      return value;
+    }
+
+    if (token.type === "ident") {
+      consume("ident");
+      const name = token.value;
+
+      if (peek()?.type === "op" && peek().value === "(") {
+        consume("op", "(");
+        const args = [parseExpression()];
+        while (peek()?.type === "op" && peek().value === ",") {
+          consume("op", ",");
+          args.push(parseExpression());
+        }
+        consume("op", ")");
+        const fn = MATH_FUNCTIONS[name];
+        if (!fn) {
+          throw new Error(`Unknown function: ${name}`);
+        }
+        return fn(...args);
+      }
+
+      if (name in MATH_CONSTANTS) {
+        return MATH_CONSTANTS[name];
+      }
+
+      throw new Error(`Unknown identifier: ${name}`);
+    }
+
+    throw new Error("Invalid expression syntax.");
+  }
+
+  const result = parseExpression();
+  if (pos !== tokens.length) {
+    throw new Error("Unexpected trailing tokens in expression.");
+  }
+  return result;
+}
+
+function evaluateMathExpression(expr) {
+  const cleaned = String(expr || "").trim();
+  if (!cleaned) {
+    throw new Error("Empty expression.");
+  }
+  if (cleaned.length > MATH_EXPRESSION_MAX_LENGTH) {
+    throw new Error("Expression too long.");
+  }
+
+  const tokens = tokenizeMathExpression(cleaned);
+  if (!tokens.length) {
+    throw new Error("Empty expression.");
+  }
+
+  const value = parseMathExpressionTokens(tokens);
+  if (!Number.isFinite(value)) {
+    throw new Error("Expression did not evaluate to a finite number.");
+  }
+
+  return value;
+}
+
+function extractExpressionLine(rawAnswer) {
+  const text = String(rawAnswer || "");
+  const tagged = text.match(/(?:EXPR|式)\s*[:：]\s*(.+)$/i);
+  if (tagged) {
+    // The model sometimes appends "= result" despite instructions; drop it
+    // since our grammar has no '=' operator and everything past it is noise.
+    return tagged[1].replace(/\s*=\s*[^=]*$/, "").trim();
+  }
+
+  // Weaker models (e.g. flash-lite) sometimes drop the "EXPR:" tag entirely.
+  // If the whole answer already looks like a bare arithmetic expression
+  // (not a plain number, no natural-language characters), treat it as the
+  // expression anyway rather than losing the calculation-offload benefit.
+  const trimmed = text.trim();
+  const hasOperatorBeyondSign = /[+\-*/^%()]/.test(trimmed.replace(/^-/, ""));
+  const isPureMathChars = /^[0-9eE+\-*/^%().\s]+$/.test(trimmed);
+  return isPureMathChars && hasOperatorBeyondSign ? trimmed : "";
+}
+
+function formatNumericAnswer(value) {
+  if (!Number.isFinite(value)) {
+    return "";
+  }
+
+  const normalized = Object.is(value, -0) ? 0 : value;
+
+  if (Number.isInteger(normalized) && Math.abs(normalized) < 1e15) {
+    return String(normalized);
+  }
+
+  const abs = Math.abs(normalized);
+  let decimals = 6;
+  if (abs < 1) {
+    decimals = Math.min(12, Math.max(6, Math.ceil(-Math.log10(abs)) + 4));
+  }
+
+  const text = normalized.toFixed(decimals);
+  return text.replace(/(\.\d*?)0+$/, "$1").replace(/\.$/, "");
+}
+
 function sanitizeAnswer(answer, question, options, targetType = "standard") {
   const answerMode = detectAnswerMode(question, options, targetType);
   const rawAnswer = normalizeText(answer);
@@ -1362,6 +1657,23 @@ function sanitizeAnswer(answer, question, options, targetType = "standard") {
   }
 
   if (answerMode === "number") {
+    const expressionText = extractExpressionLine(rawAnswer);
+    if (expressionText) {
+      try {
+        const computed = evaluateMathExpression(expressionText);
+        const formatted = formatNumericAnswer(computed);
+        if (formatted) {
+          return formatted;
+        }
+      } catch (error) {
+        console.warn(
+          "Failed to evaluate EXPR answer, falling back to text parsing:",
+          expressionText,
+          error
+        );
+      }
+    }
+
     const normalizedAnswer = rawAnswer.replace(/[\u2212\u2013\u2014]/g, "-");
     const exponentMatch = normalizedAnswer.match(/\^\s*(-?\d+(?:\.\d+)?)/);
     if (
@@ -1465,6 +1777,26 @@ function getProviderLabel(providerId) {
   }
 
   return "OpenAI";
+}
+
+const MAX_FALLBACK_LOG_ENTRIES = 50;
+
+// Fallback events (a provider failing and the next one taking over) used to
+// be shown inline on every hint panel, which got noisy fast. They're now
+// tucked away in a rotating log the popup can show on demand instead.
+function logFallbackEvent(message) {
+  const cleanedMessage = normalizeText(message);
+  if (!cleanedMessage) {
+    return;
+  }
+
+  chrome.storage.local.get({ fallbackLogs: [] }, (items) => {
+    const logs = Array.isArray(items.fallbackLogs) ? items.fallbackLogs : [];
+    logs.push({ time: Date.now(), message: cleanedMessage });
+    chrome.storage.local.set({
+      fallbackLogs: logs.slice(-MAX_FALLBACK_LOG_ENTRIES),
+    });
+  });
 }
 
 async function requestChatCompletion(
@@ -1585,7 +1917,24 @@ async function requestChatCompletion(
           signal: controller?.signal,
         });
 
-        const data = await readJsonResponse(response);
+        let data;
+        try {
+          data = await readJsonResponse(response);
+        } catch (readError) {
+          // Bare messages like "HTTP 404" give no clue which provider/model
+          // caused it once they surface in the extension's error log — bake
+          // that context in so a future failure is self-diagnosing.
+          throw createHttpError(
+            `${providerLabel} (${model}) ${readError.message} [${endpoint}]`,
+            {
+              status: readError.status,
+              isRateLimit: readError.isRateLimit,
+              isAuthError: readError.isAuthError,
+              skipRemainingProvider: readError.skipRemainingProvider,
+              retryAfterMs: readError.retryAfterMs,
+            }
+          );
+        }
         const bodyErrorMessage = normalizeText(
           data?.error?.message || data?.error || ""
         );
@@ -1639,14 +1988,16 @@ async function requestChatCompletion(
           providerId === PROVIDER_GEMINI &&
           isGeminiQuotaOrBalanceError(requestError)
         ) {
+          // Throw immediately instead of break+continue: a plain `break`
+          // here only exits the endpoint loop, and the outer attempt loop
+          // would just retry the SAME rate-limited/exhausted model again
+          // (worsening the rate limit) before finally giving up.
           requestError.skipRemainingProvider = true;
-          shouldRetryAttempt = false;
-          lastError = requestError;
           console.warn(
             "Gemini quota/balance exhausted. Switching to the next provider:",
             requestError
           );
-          break;
+          throw requestError;
         }
         lastError = requestError;
         const freeLimitExhausted =
@@ -1654,12 +2005,11 @@ async function requestChatCompletion(
           (Number(requestError?.status) === 402 ||
             isOpenRouterFreeLimitMessage(requestError?.message));
         if (freeLimitExhausted) {
-          shouldRetryAttempt = false;
           console.warn("OpenRouter free model limit reached:", {
             model,
             reason: normalizeText(requestError?.message || "free limit reached"),
           });
-          break;
+          throw requestError;
         }
 
         const canRetry =
@@ -1705,9 +2055,15 @@ async function requestChatCompletion(
     );
   }
 
-  throw new Error(
-    lastError?.message || `Failed to get a response from ${providerLabel} API.`
-  );
+  // Re-throw the original error object (not a fresh Error) so metadata like
+  // skipRemainingProvider survives — otherwise callers can never tell a
+  // Gemini quota-exhaustion failure apart from any other failure, and the
+  // "move to the next provider" fallback never actually triggers.
+  if (lastError) {
+    throw lastError;
+  }
+
+  throw new Error(`Failed to get a response from ${providerLabel} API.`);
 }
 
 async function buildModelPolicy(providerOrder, credentials) {
@@ -1787,6 +2143,11 @@ async function callCapiChat(
 
   let lastInvalidAnswer = "";
   let lastError = null;
+  // Unified across BOTH failure kinds (thrown errors and answers rejected
+  // as invalid) so the fallback note below can't miss the common case where
+  // a provider responds fine but its answer just doesn't pass validation.
+  let lastFailureSummary = "";
+  let lastFailureProviderId = "";
   const skippedProviders = new Set();
 
   for (const plan of buildRequestPlans(
@@ -1830,6 +2191,8 @@ async function callCapiChat(
         )
       ) {
         lastInvalidAnswer = rawAnswer;
+        lastFailureSummary = `invalid answer "${extractFirstLine(rawAnswer)}"`;
+        lastFailureProviderId = plan.providerId;
         console.warn("Rejected invalid answer:", {
           model: plan.model,
           answer: rawAnswer,
@@ -1842,10 +2205,35 @@ async function callCapiChat(
         model: response.resolvedModel || plan.model,
         provider: plan.providerId,
       };
+
+      // Surface the raw calculation so the user can sanity-check it (e.g.
+      // verify the circuit topology the model assumed) instead of just
+      // trusting an opaque number.
+      const answerMode = detectAnswerMode(cleanedQuestion, cleanedOptions, targetType);
+      if (answerMode === "number") {
+        const expressionText = extractExpressionLine(rawAnswer);
+        if (expressionText) {
+          result.expression = expressionText;
+        }
+      }
+
+      // A provider silently failing and falling back to the next one is
+      // invisible from the panel alone (it just shows the provider that
+      // finally succeeded) — surface it so this doesn't need a console dig.
+      if (lastFailureSummary && lastFailureProviderId && lastFailureProviderId !== plan.providerId) {
+        result.fallbackNote = `${getProviderLabel(lastFailureProviderId)} failed (${lastFailureSummary.slice(
+          0,
+          160
+        )}) -> used ${getProviderLabel(plan.providerId)} instead`;
+        logFallbackEvent(result.fallbackNote);
+      }
+
       answerCache.set(cacheKey, result);
       return result;
     } catch (error) {
       lastError = error;
+      lastFailureSummary = normalizeText(error?.message || String(error));
+      lastFailureProviderId = plan.providerId;
       if (error?.skipRemainingProvider) {
         skippedProviders.add(plan.providerId);
       }
@@ -1872,6 +2260,535 @@ async function callCapiChat(
   throw new Error(lastError?.message || "Failed to get a valid response from configured APIs.");
 }
 
+function normalizeGapfillBlanks(blanks) {
+  if (!Array.isArray(blanks)) {
+    return [];
+  }
+
+  return blanks
+    .map((blank, index) => ({
+      label: normalizeText(blank?.label) || `空白${index + 1}`,
+      options: Array.isArray(blank?.options)
+        ? blank.options.map((option) => normalizeText(option)).filter(Boolean)
+        : [],
+    }))
+    .filter((blank) => blank.options.length);
+}
+
+function buildGapfillPrompt(markedText, blanks) {
+  const instructions = [
+    "Fill every numbered blank in the sentence below.",
+    "Each blank is written as [1], [2], and so on.",
+    "For each blank choose the single best option from that blank's own choice list, copied character-for-character.",
+    "The blanks are related to each other (e.g. an opening tag and its matching closing tag), so decide all of them together so the whole sentence makes sense as one unit.",
+    'Output exactly one line per blank in the form "N: answer" — for example "1: canvas".',
+    'Use only the plain blank number before the colon (no brackets, no word "Blank", no extra text).',
+    "Do not add explanations, headers, or any line that is not one of the numbered answers.",
+  ];
+
+  if (containsJapanese(markedText)) {
+    instructions.push("Keep each option text exactly as given (do not translate).");
+  }
+
+  const choiceLines = blanks.map(
+    (blank, index) => `[${index + 1}]: ${blank.options.join(" | ")}`
+  );
+
+  return [
+    ...instructions,
+    "",
+    `Sentence: ${markedText}`,
+    "",
+    "Choices:",
+    ...choiceLines,
+  ].join("\n");
+}
+
+function parseGapfillAnswers(rawText, blanks) {
+  const byIndex = new Map();
+
+  for (const rawLine of String(rawText || "").split(/\r?\n/)) {
+    const line = normalizeText(rawLine);
+    const match = line.match(/^\[?\s*(\d+)\s*\]?\s*[:：.)\-]\s*(.+)$/);
+    if (!match) {
+      continue;
+    }
+
+    const index = Number(match[1]) - 1;
+    if (index < 0 || index >= blanks.length || byIndex.has(index)) {
+      continue;
+    }
+
+    byIndex.set(index, match[2]);
+  }
+
+  return blanks.map((blank, index) => {
+    const rawAnswer = byIndex.get(index) || "";
+    const matchedOption = findMatchingOption(rawAnswer, blank.options);
+    return {
+      label: blank.label,
+      answer: matchedOption || normalizeText(rawAnswer),
+      valid: Boolean(matchedOption),
+    };
+  });
+}
+
+async function callGapfillChat(
+  markedText,
+  rawBlanks,
+  requestKey = "",
+  detailedMode = false,
+  materialMode = false,
+  materialRevision = 0,
+  materialContext = "",
+  useAccuracyProfile = false,
+  providerOrder = DEFAULT_PROVIDER_ORDER,
+  credentials = {},
+  images = []
+) {
+  const blanks = normalizeGapfillBlanks(rawBlanks);
+  if (!blanks.length) {
+    throw new Error("No answerable blanks were provided.");
+  }
+
+  const cleanedText = normalizeText(markedText);
+  const cleanedImages = sanitizeImages(images);
+  const modelPolicy = await buildModelPolicy(providerOrder, credentials);
+  const cacheKey = JSON.stringify({
+    gapfill: true,
+    requestKey: requestKey || cleanedText,
+    blanks,
+    detailedMode: Boolean(detailedMode),
+    materialMode: Boolean(materialMode),
+    materialRevision: Number(materialRevision) || 0,
+    useAccuracyProfile: Boolean(useAccuracyProfile),
+    providerOrder: normalizeProviderOrder(providerOrder),
+    freeApiMode: modelPolicy.freeApiMode,
+    openRouterBudgetMode: modelPolicy.openRouterBudgetMode,
+    imagesFingerprint: cleanedImages.map((image) => image.length).join(","),
+  });
+
+  if (answerCache.has(cacheKey)) {
+    return answerCache.get(cacheKey);
+  }
+
+  const effectiveDetailedMode = detailedMode || useAccuracyProfile;
+  const hasImages = Boolean(cleanedImages.length);
+  let plans = buildProviderModelPlans(providerOrder, useAccuracyProfile, {
+    ...modelPolicy,
+    detailedMode: effectiveDetailedMode,
+    hasImages,
+  });
+  if (hasImages) {
+    const visionPlans = plans.filter(
+      (plan) => !NON_VISION_MODEL_PATTERN.test(plan.model)
+    );
+    if (visionPlans.length) {
+      plans = visionPlans;
+    }
+  }
+  if (!plans.length) {
+    throw new Error("No usable model is configured for gapfill questions.");
+  }
+
+  const prompt = buildGapfillPrompt(cleanedText, blanks);
+  const maxTokens = Math.max(64, blanks.length * 24 + 24);
+
+  let lastError = null;
+  let lastFailureSummary = "";
+  let lastFailureProviderId = "";
+  let bestPartial = null;
+  const skippedProviders = new Set();
+
+  for (const plan of plans) {
+    if (skippedProviders.has(plan.providerId)) {
+      continue;
+    }
+
+    try {
+      const response = await requestChatCompletion(
+        plan.providerId,
+        plan.model,
+        prompt,
+        maxTokens,
+        credentials,
+        {
+          images: cleanedImages,
+          allowThinking: effectiveDetailedMode || hasImages,
+        }
+      );
+      const answers = parseGapfillAnswers(response.answer, blanks);
+      const validCount = answers.filter((answer) => answer.valid).length;
+      const result = {
+        answers,
+        model: response.resolvedModel || plan.model,
+        provider: plan.providerId,
+      };
+
+      if (validCount === blanks.length) {
+        if (
+          lastFailureSummary &&
+          lastFailureProviderId &&
+          lastFailureProviderId !== plan.providerId
+        ) {
+          result.fallbackNote = `${getProviderLabel(lastFailureProviderId)} failed (${lastFailureSummary.slice(
+            0,
+            160
+          )}) -> used ${getProviderLabel(plan.providerId)} instead`;
+          logFallbackEvent(result.fallbackNote);
+        }
+        answerCache.set(cacheKey, result);
+        return result;
+      }
+
+      lastFailureSummary = `only ${validCount}/${blanks.length} blanks valid`;
+      lastFailureProviderId = plan.providerId;
+
+      if (!bestPartial || validCount > bestPartial.validCount) {
+        bestPartial = { ...result, validCount };
+      }
+
+      console.warn("Gapfill answer incomplete:", {
+        model: plan.model,
+        validCount,
+        expected: blanks.length,
+      });
+    } catch (error) {
+      lastError = error;
+      lastFailureSummary = normalizeText(error?.message || String(error));
+      lastFailureProviderId = plan.providerId;
+      if (error?.skipRemainingProvider) {
+        skippedProviders.add(plan.providerId);
+      }
+      console.warn(
+        `${getProviderLabel(plan.providerId)} gapfill request failed for model ${plan.model}:`,
+        error
+      );
+    }
+  }
+
+  if (bestPartial) {
+    const { validCount, ...result } = bestPartial;
+    if (
+      lastFailureSummary &&
+      lastFailureProviderId &&
+      lastFailureProviderId !== result.provider
+    ) {
+      result.fallbackNote = `${getProviderLabel(lastFailureProviderId)} failed (${lastFailureSummary.slice(
+        0,
+        160
+      )}) -> used ${getProviderLabel(result.provider)} instead`;
+      logFallbackEvent(result.fallbackNote);
+    }
+    answerCache.set(cacheKey, result);
+    return result;
+  }
+
+  throw new Error(lastError?.message || "Failed to get a gapfill response.");
+}
+
+function normalizeMultiBlankBlanks(blanks) {
+  if (!Array.isArray(blanks)) {
+    return [];
+  }
+
+  return blanks
+    .map((blank, index) => ({
+      label: normalizeText(blank?.label) || `空白${index + 1}`,
+      fieldType: normalizeText(blank?.fieldType) || "blank",
+    }))
+    .filter((blank) => blank.label);
+}
+
+function buildMultiBlankPrompt(markedText, blanks, hasImages) {
+  const instructions = [
+    "This is one multi-part problem with several related blanks, written as [1], [2], and so on in the text below.",
+    "The blanks depend on each other (e.g. currents in the same circuit, or a later part building on an earlier part's setup), so work through the WHOLE problem once and keep every answer consistent with the others.",
+    "Pay close attention to which section/part of the problem each blank belongs to. Do not reuse a value, formula, or assumption from a different part unless it still genuinely applies there.",
+    'If a blank\'s value requires a calculation, output that line as "N: EXPR: <expression>" — a plain arithmetic expression using only +, -, *, /, ^, parentheses, and decimal or scientific-notation numbers. You are bad at arithmetic, so never compute the final value yourself when a calculation is needed.',
+    'If a blank is a simple lookup, symbol, or short word/name answer with no calculation, output that line as "N: <answer>" instead.',
+    'Example: "1: EXPR: 8 / (100 * 400 / (100 + 400))" or "2: canvas".',
+    "Output exactly one line per blank, in order, and nothing else — no headers, no explanations, no restated question.",
+  ];
+
+  if (hasImages) {
+    instructions.push(
+      "One or more images are attached (diagrams or figures). Read them carefully — they define the structure (e.g. circuit topology) needed to answer correctly, and it may differ between parts."
+    );
+  }
+
+  if (containsJapanese(markedText)) {
+    instructions.push("Answer in Japanese for any blank that expects a word rather than a number.");
+  }
+
+  const blankList = blanks
+    .map((blank, index) => `[${index + 1}]: ${blank.label}`)
+    .join("\n");
+
+  return [
+    ...instructions,
+    "",
+    `Problem: ${markedText}`,
+    "",
+    "Blanks:",
+    blankList,
+  ].join("\n");
+}
+
+function buildMultiBlankAnswersFromMap(byIndex, blanks, markedText) {
+  return blanks.map((blank, index) => {
+    const rawAnswer = byIndex.get(index) || "";
+    const fieldType = blank.fieldType || "blank";
+    const sanitized = sanitizeAnswer(rawAnswer, markedText, [], fieldType);
+    const answerMode = detectAnswerMode(markedText, [], fieldType);
+
+    let expression = "";
+    if (answerMode === "number") {
+      const exprText = extractExpressionLine(rawAnswer);
+      if (exprText) {
+        expression = exprText;
+      }
+    }
+
+    return {
+      label: blank.label,
+      answer: sanitized,
+      expression,
+      valid:
+        Boolean(sanitized) &&
+        !isLikelyInvalidAnswer(sanitized, markedText, [], fieldType),
+    };
+  });
+}
+
+function parseMultiBlankAnswers(rawText, blanks, markedText) {
+  const numberedLines = [];
+
+  for (const rawLine of String(rawText || "").split(/\r?\n/)) {
+    const line = normalizeText(rawLine);
+    const match = line.match(/^\[?\s*(\d+)\s*\]?\s*[:：.)\-]\s*(.+)$/);
+    if (!match) {
+      continue;
+    }
+
+    numberedLines.push({
+      claimedIndex: Number(match[1]) - 1,
+      content: match[2],
+    });
+  }
+
+  // Trust the model's own numbering first.
+  const byClaimedIndex = new Map();
+  for (const { claimedIndex, content } of numberedLines) {
+    if (
+      claimedIndex >= 0 &&
+      claimedIndex < blanks.length &&
+      !byClaimedIndex.has(claimedIndex)
+    ) {
+      byClaimedIndex.set(claimedIndex, content);
+    }
+  }
+  const claimedAnswers = buildMultiBlankAnswersFromMap(byClaimedIndex, blanks, markedText);
+  const claimedValidCount = claimedAnswers.filter((answer) => answer.valid).length;
+
+  if (claimedValidCount >= blanks.length) {
+    return claimedAnswers;
+  }
+
+  // The model sometimes skips or miscounts a number (e.g. starts at "2:"
+  // instead of "1:"), which silently shifts every answer onto the wrong
+  // blank instead of just failing loudly. As a fallback, also try trusting
+  // plain appearance order over the model's own (possibly wrong) numbers.
+  const byPosition = new Map();
+  numberedLines.forEach((entry, position) => {
+    if (position < blanks.length) {
+      byPosition.set(position, entry.content);
+    }
+  });
+  const positionalAnswers = buildMultiBlankAnswersFromMap(byPosition, blanks, markedText);
+  const positionalValidCount = positionalAnswers.filter((answer) => answer.valid).length;
+
+  if (positionalValidCount > claimedValidCount) {
+    return positionalAnswers;
+  }
+
+  // Format-validity alone can't tell "0.1 is I's value" from "0.1 is I1's
+  // value" — a shifted numbering scheme looks equally valid either way, so
+  // validCount alone ties. If the model's own numbers are monotonically
+  // increasing in appearance order but don't start at 1, that's the
+  // signature of a consistent off-by-N shift (e.g. it skipped "1:" and
+  // began at "2:"), and appearance order is the more trustworthy mapping.
+  const isMonotonic = numberedLines.every(
+    (entry, i) => i === 0 || entry.claimedIndex > numberedLines[i - 1].claimedIndex
+  );
+  const looksShifted =
+    isMonotonic && numberedLines.length > 0 && numberedLines[0].claimedIndex !== 0;
+
+  if (looksShifted && positionalValidCount === claimedValidCount) {
+    return positionalAnswers;
+  }
+
+  return claimedAnswers;
+}
+
+async function callMultiBlankChat(
+  markedText,
+  rawBlanks,
+  requestKey = "",
+  detailedMode = false,
+  materialMode = false,
+  materialRevision = 0,
+  materialContext = "",
+  useAccuracyProfile = false,
+  providerOrder = DEFAULT_PROVIDER_ORDER,
+  credentials = {},
+  images = []
+) {
+  const blanks = normalizeMultiBlankBlanks(rawBlanks);
+  if (!blanks.length) {
+    throw new Error("No answerable blanks were provided.");
+  }
+
+  const cleanedText = normalizeText(markedText);
+  const cleanedImages = sanitizeImages(images);
+  const modelPolicy = await buildModelPolicy(providerOrder, credentials);
+  const cacheKey = JSON.stringify({
+    multiblank: true,
+    requestKey: requestKey || cleanedText,
+    blanks,
+    detailedMode: Boolean(detailedMode),
+    materialMode: Boolean(materialMode),
+    materialRevision: Number(materialRevision) || 0,
+    useAccuracyProfile: Boolean(useAccuracyProfile),
+    providerOrder: normalizeProviderOrder(providerOrder),
+    freeApiMode: modelPolicy.freeApiMode,
+    openRouterBudgetMode: modelPolicy.openRouterBudgetMode,
+    imagesFingerprint: cleanedImages.map((image) => image.length).join(","),
+  });
+
+  if (answerCache.has(cacheKey)) {
+    return answerCache.get(cacheKey);
+  }
+
+  const effectiveDetailedMode = detailedMode || useAccuracyProfile;
+  const hasImages = Boolean(cleanedImages.length);
+  let plans = buildProviderModelPlans(providerOrder, useAccuracyProfile, {
+    ...modelPolicy,
+    detailedMode: effectiveDetailedMode,
+    hasImages,
+  });
+  if (hasImages) {
+    const visionPlans = plans.filter(
+      (plan) => !NON_VISION_MODEL_PATTERN.test(plan.model)
+    );
+    if (visionPlans.length) {
+      plans = visionPlans;
+    }
+  }
+  if (!plans.length) {
+    throw new Error("No usable model is configured for multi-part questions.");
+  }
+
+  const prompt = buildMultiBlankPrompt(cleanedText, blanks, hasImages);
+  // Multi-part problems (often calculation-heavy) benefit from a larger
+  // token budget and always get some thinking room, since collapsing
+  // several related sub-answers into one pass is inherently harder than a
+  // single blank.
+  const maxTokens = Math.max(96, blanks.length * 48 + 32);
+
+  let lastError = null;
+  let lastFailureSummary = "";
+  let lastFailureProviderId = "";
+  let bestPartial = null;
+  const skippedProviders = new Set();
+
+  for (const plan of plans) {
+    if (skippedProviders.has(plan.providerId)) {
+      continue;
+    }
+
+    try {
+      const response = await requestChatCompletion(
+        plan.providerId,
+        plan.model,
+        prompt,
+        maxTokens,
+        credentials,
+        { images: cleanedImages, allowThinking: true }
+      );
+      const answers = parseMultiBlankAnswers(response.answer, blanks, cleanedText);
+      const validCount = answers.filter((answer) => answer.valid).length;
+      const result = {
+        answers,
+        model: response.resolvedModel || plan.model,
+        provider: plan.providerId,
+      };
+
+      if (validCount === blanks.length) {
+        if (
+          lastFailureSummary &&
+          lastFailureProviderId &&
+          lastFailureProviderId !== plan.providerId
+        ) {
+          result.fallbackNote = `${getProviderLabel(lastFailureProviderId)} failed (${lastFailureSummary.slice(
+            0,
+            160
+          )}) -> used ${getProviderLabel(plan.providerId)} instead`;
+          logFallbackEvent(result.fallbackNote);
+        }
+        answerCache.set(cacheKey, result);
+        return result;
+      }
+
+      lastFailureSummary = `only ${validCount}/${blanks.length} blanks valid`;
+      lastFailureProviderId = plan.providerId;
+
+      if (!bestPartial || validCount > bestPartial.validCount) {
+        bestPartial = { ...result, validCount };
+      }
+
+      console.warn("Multi-blank answer incomplete:", {
+        model: plan.model,
+        validCount,
+        expected: blanks.length,
+        blanks: blanks.map((blank) => blank.label),
+        answers: answers.map((answer) => `${answer.label}=${answer.answer || "(empty)"}`),
+        rawResponse: response.answer,
+      });
+    } catch (error) {
+      lastError = error;
+      lastFailureSummary = normalizeText(error?.message || String(error));
+      lastFailureProviderId = plan.providerId;
+      if (error?.skipRemainingProvider) {
+        skippedProviders.add(plan.providerId);
+      }
+      console.warn(
+        `${getProviderLabel(plan.providerId)} multi-blank request failed for model ${plan.model}:`,
+        error
+      );
+    }
+  }
+
+  if (bestPartial) {
+    const { validCount, ...result } = bestPartial;
+    if (
+      lastFailureSummary &&
+      lastFailureProviderId &&
+      lastFailureProviderId !== result.provider
+    ) {
+      result.fallbackNote = `${getProviderLabel(lastFailureProviderId)} failed (${lastFailureSummary.slice(
+        0,
+        160
+      )}) -> used ${getProviderLabel(result.provider)} instead`;
+      logFallbackEvent(result.fallbackNote);
+    }
+    answerCache.set(cacheKey, result);
+    return result;
+  }
+
+  throw new Error(lastError?.message || "Failed to get a multi-blank response.");
+}
+
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action !== "getAnswer") {
     return false;
@@ -1881,6 +2798,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     question,
     options,
     images,
+    blanks,
     requestKey,
     targetType,
     fieldLabel,
@@ -1888,11 +2806,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     materialMode,
     materialRevision,
   } = request;
+  const hasBlanks = Array.isArray(blanks) && blanks.length > 0;
+  const isGapfill = targetType === "gapfill" && hasBlanks;
+  const isMultiBlank = targetType === "multiblank" && hasBlanks;
   const cleanedImages = sanitizeImages(images);
   console.log(
     "Received from content:",
     question,
-    options,
+    hasBlanks ? `blanks=${blanks.length}` : options,
     targetType,
     fieldLabel,
     detailedMode,
@@ -1911,6 +2832,16 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         );
       }
 
+      const droppedForMissingKey = normalizeProviderOrder(
+        materialState.apiProviders
+      ).filter((providerId) => !activeProviders.includes(providerId));
+      if (droppedForMissingKey.length) {
+        console.warn(
+          "Skipping configured provider(s) with no API key set (check the popup):",
+          droppedForMissingKey.map(getProviderLabel)
+        );
+      }
+
       const shouldUseMaterial =
         Boolean(materialMode) &&
         materialState.materialMode &&
@@ -1925,6 +2856,42 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         : "";
 
       console.log("Model profile:", shouldUseAccuracyProfile ? "material-accuracy" : "standard");
+
+      if (isGapfill) {
+        return enqueueAiRequest(() =>
+          callGapfillChat(
+            question,
+            blanks,
+            requestKey,
+            detailedMode,
+            shouldUseMaterial,
+            selectedMaterialRevision,
+            selectedMaterialContext,
+            shouldUseAccuracyProfile,
+            activeProviders,
+            materialState,
+            cleanedImages
+          )
+        );
+      }
+
+      if (isMultiBlank) {
+        return enqueueAiRequest(() =>
+          callMultiBlankChat(
+            question,
+            blanks,
+            requestKey,
+            detailedMode,
+            shouldUseMaterial,
+            selectedMaterialRevision,
+            selectedMaterialContext,
+            shouldUseAccuracyProfile,
+            activeProviders,
+            materialState,
+            cleanedImages
+          )
+        );
+      }
 
       return enqueueAiRequest(() =>
         callCapiChat(
@@ -1944,6 +2911,26 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       );
     })
     .then((result) => {
+      if (isGapfill || isMultiBlank) {
+        const answers = Array.isArray(result?.answers) ? result.answers : [];
+        const model = normalizeText(result?.model || "");
+        const provider = normalizeText(result?.provider || "");
+        const fallbackNote = normalizeText(result?.fallbackNote || "");
+        console.log(
+          isMultiBlank ? "Parsed multi-blank answers:" : "Parsed gapfill answers:",
+          answers
+            .map((item) => `${item.label}=${item.answer}${item.expression ? ` (${item.expression})` : ""}`)
+            .join(", "),
+          "model:",
+          model || "(unknown)",
+          "provider:",
+          provider || "(unknown)",
+          fallbackNote ? `fallback: ${fallbackNote}` : ""
+        );
+        sendResponse({ answers, model, provider, fallbackNote });
+        return;
+      }
+
       const answer = normalizeText(
         typeof result === "string" ? result : result?.answer || ""
       );
@@ -1953,6 +2940,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       const provider = normalizeText(
         typeof result === "object" ? result?.provider || "" : ""
       );
+      const expression = normalizeText(
+        typeof result === "object" ? result?.expression || "" : ""
+      );
+      const fallbackNote = normalizeText(
+        typeof result === "object" ? result?.fallbackNote || "" : ""
+      );
 
       console.log(
         "Parsed answer:",
@@ -1960,9 +2953,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         "model:",
         model || "(unknown)",
         "provider:",
-        provider || "(unknown)"
+        provider || "(unknown)",
+        expression ? `expr: ${expression}` : "",
+        fallbackNote ? `fallback: ${fallbackNote}` : ""
       );
-      sendResponse({ answer, model, provider });
+      sendResponse({ answer, model, provider, expression, fallbackNote });
     })
     .catch((error) => {
       console.error("Error calling AI API:", error);

@@ -187,6 +187,53 @@
         min-height: 18px;
       }
 
+      .logs-toggle {
+        cursor: pointer;
+      }
+
+      .logs-chevron {
+        font-weight: 700;
+        color: var(--muted);
+        transition: transform 0.15s ease;
+      }
+
+      .logs-toggle[aria-expanded="true"] .logs-chevron {
+        transform: rotate(90deg);
+      }
+
+      .logs-panel {
+        margin-top: 10px;
+      }
+
+      .logs-list {
+        max-height: 220px;
+        overflow-y: auto;
+        display: grid;
+        gap: 6px;
+        margin-bottom: 8px;
+      }
+
+      .logs-empty {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .logs-entry {
+        padding: 8px 10px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: #fff;
+        font-size: 12px;
+        color: var(--text);
+        word-break: break-word;
+      }
+
+      .logs-entry-time {
+        color: var(--muted);
+        font-weight: 700;
+        margin-bottom: 2px;
+      }
+
       .materials-controls {
         display: grid;
         gap: 8px;
@@ -285,6 +332,17 @@
         color: var(--muted);
       }
 
+      .provider-warning {
+        font-size: 11px;
+        font-weight: 700;
+        color: var(--warn);
+        white-space: nowrap;
+      }
+
+      .provider-warning:empty {
+        display: none;
+      }
+
       .provider-move {
         display: inline-flex;
         align-items: center;
@@ -314,13 +372,14 @@
       <section class="card">
         <div class="label">API</div>
         <div class="toggle-title">API Providers</div>
-        <div class="toggle-note">Checked providers are used from top to bottom. Use Up/Down to reorder.</div>
+        <div class="toggle-note">Checked providers are tried top to bottom. If one runs out of quota or balance, it automatically switches to the next.</div>
         <div class="provider-list" id="providerList">
           <div class="provider-item" data-provider-row data-provider="openai">
             <label class="provider-check">
               <input id="providerOpenAI" type="checkbox">
               <span>OpenAI</span>
             </label>
+            <span class="provider-warning" data-provider-warning></span>
             <span class="provider-rank" data-provider-rank>OFF</span>
             <div class="provider-move">
               <button type="button" class="provider-move-btn" data-provider-move="up" data-provider="openai">Up</button>
@@ -332,6 +391,7 @@
               <input id="providerGemini" type="checkbox">
               <span>Gemini (AI Studio free tier)</span>
             </label>
+            <span class="provider-warning" data-provider-warning></span>
             <span class="provider-rank" data-provider-rank>OFF</span>
             <div class="provider-move">
               <button type="button" class="provider-move-btn" data-provider-move="up" data-provider="gemini">Up</button>
@@ -343,6 +403,7 @@
               <input id="providerOpenRouter" type="checkbox">
               <span>OpenRouter (Gemini)</span>
             </label>
+            <span class="provider-warning" data-provider-warning></span>
             <span class="provider-rank" data-provider-rank>OFF</span>
             <div class="provider-move">
               <button type="button" class="provider-move-btn" data-provider-move="up" data-provider="openrouter">Up</button>
@@ -477,6 +538,22 @@
         </div>
         <button class="resume" id="resumeButton" type="button">Resume Now</button>
         <div class="pause-note" id="pauseNote"></div>
+      </section>
+
+      <section class="card">
+        <div class="toggle logs-toggle" id="logsToggleRow" role="button" tabindex="0" aria-expanded="false">
+          <div>
+            <p class="toggle-title">Logs</p>
+            <p class="toggle-note">Provider fallback events. Click to expand.</p>
+          </div>
+          <span class="logs-chevron" id="logsChevron">▸</span>
+        </div>
+        <div class="logs-panel" id="logsPanel" hidden>
+          <div class="logs-list" id="logsList"></div>
+          <div class="materials-actions">
+            <button id="clearLogsButton" type="button">Clear Logs</button>
+          </div>
+        </div>
       </section>
     </main>
 
