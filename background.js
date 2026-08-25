@@ -1,27 +1,17 @@
 const PROVIDER_OPENAI = "openai";
 const PROVIDER_OPENROUTER = "openrouter";
 const PROVIDER_GEMINI = "gemini";
-const PROVIDER_CAPI = "capi";
 const OPENAI_ENDPOINT = "https://api.openai.com/v1/chat/completions";
 const OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions";
 const OPENROUTER_KEY_ENDPOINT = "https://openrouter.ai/api/v1/key";
 const GEMINI_ENDPOINT_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
-const CAPI_BASE_URL = "https://capi.voids.top/v2";
-const CAPI_ENDPOINTS = [
-  `${CAPI_BASE_URL}/chat/completions`,
-  `${CAPI_BASE_URL}/chat`,
-  `${CAPI_BASE_URL}/completions`,
-];
 const OPENROUTER_APP_URL = "https://openrouter.ai";
 const OPENROUTER_APP_TITLE = "MoodleFuck";
 
-const OPENAI_STANDARD_MODEL_IDS = ["gpt-5-mini", "gpt-4.1-mini", "gpt-4.1"];
-const OPENAI_MATERIAL_ACCURACY_MODEL_IDS = [
-  "gpt-5.1",
-  "gpt-5",
-  "gpt-5-mini",
-  "gpt-4.1",
-];
+// Start with the fastest cost-sensitive GPT-5.6 model. If the request fails
+// or its answer is rejected by validation, the existing plan loop escalates
+// to Terra for a stronger second attempt.
+const OPENAI_MODEL_IDS = ["gpt-5.6-luna", "gpt-5.6-terra"];
 
 const OPENROUTER_GEMINI_STANDARD_MODEL_IDS = [
   "google/gemini-2.5-flash-lite",
@@ -72,17 +62,13 @@ const GEMINI_DETAILED_MODEL_IDS = [
   "gemini-2.5-flash-lite",
 ];
 const GEMINI_IMAGE_MODEL_IDS = ["gemini-2.5-flash", "gemini-2.5-flash-lite"];
-const CAPI_STANDARD_MODEL_IDS = ["gpt-4o-2024-11-20", "gpt-4o", "gpt-4.1"];
-const CAPI_MATERIAL_ACCURACY_MODEL_IDS = [
-  "gpt-4o-2024-11-20",
-  "gpt-4.1",
-  "gemini-2.5-flash",
+// Prefer OpenAI's official API on fresh installs. Providers without a saved
+// key are skipped, so Gemini and OpenRouter remain usable fallbacks.
+const DEFAULT_PROVIDER_ORDER = [
+  PROVIDER_OPENAI,
+  PROVIDER_GEMINI,
+  PROVIDER_OPENROUTER,
 ];
-// Gemini's native API has a genuinely free tier, so it's the more sensible
-// default to try first; OpenRouter (paid) kicks in once that free quota is
-// exhausted. Users who already saved a custom order in the popup are
-// unaffected — this only applies to fresh installs.
-const DEFAULT_PROVIDER_ORDER = [PROVIDER_GEMINI, PROVIDER_OPENROUTER];
 const MATERIAL_CONTEXT_MAX_CHARS = 120000;
 const MATERIAL_REFERENCE_MAX_CHARS = 9000;
 const MATERIAL_CHUNK_MAX_CHARS = 1400;
@@ -435,10 +421,6 @@ function buildRequestHeaders(providerId, credentials) {
     "Content-Type": "application/json",
   };
 
-  if (providerId === PROVIDER_CAPI) {
-    return headers;
-  }
-
   if (providerId === PROVIDER_GEMINI) {
     const geminiApiKey = normalizeText(credentials?.geminiApiKey).replace(
       /^Bearer\s+/i,
@@ -490,13 +472,14 @@ function normalizeProviderOrder(providers) {
     PROVIDER_OPENAI,
     PROVIDER_OPENROUTER,
     PROVIDER_GEMINI,
-    PROVIDER_CAPI,
   ]);
   const seen = new Set();
   const normalized = [];
 
   for (const provider of rawProviders) {
-    const cleaned = normalizeText(provider).toLowerCase();
+    const storedProvider = normalizeText(provider).toLowerCase();
+    // Migrate installations that had the removed anonymous provider enabled.
+    const cleaned = storedProvider === "capi" ? PROVIDER_OPENAI : storedProvider;
     if (!allowed.has(cleaned) || seen.has(cleaned)) {
       continue;
     }
@@ -567,12 +550,6 @@ function getModelChain(
     return geminiModels;
   }
 
-  if (providerId === PROVIDER_CAPI) {
-    return useAccuracyProfile
-      ? dedupeModels(CAPI_MATERIAL_ACCURACY_MODEL_IDS)
-      : dedupeModels(CAPI_STANDARD_MODEL_IDS);
-  }
-
   if (providerId === PROVIDER_GEMINI) {
     if (modelPolicy?.detailedMode) {
       return dedupeModels(GEMINI_DETAILED_MODEL_IDS);
@@ -589,9 +566,7 @@ function getModelChain(
     return dedupeModels(GEMINI_STANDARD_MODEL_IDS);
   }
 
-  return useAccuracyProfile
-    ? dedupeModels(OPENAI_MATERIAL_ACCURACY_MODEL_IDS)
-    : dedupeModels(OPENAI_STANDARD_MODEL_IDS);
+  return dedupeModels(OPENAI_MODEL_IDS);
 }
 
 function buildProviderModelPlans(
@@ -616,11 +591,6 @@ function filterProvidersByCredentials(providerOrder, credentials) {
   const normalizedProviders = normalizeProviderOrder(providerOrder);
 
   for (const providerId of normalizedProviders) {
-    if (providerId === PROVIDER_CAPI) {
-      available.push(providerId);
-      continue;
-    }
-
     if (
       providerId === PROVIDER_OPENAI &&
       normalizeText(credentials?.openaiApiKey)
@@ -838,6 +808,18 @@ function buildMaterialReference(question, options, materialContext) {
 }
 
 function detectAnswerMode(question, options, targetType = "standard") {
+  if (targetType === "ordering") {
+    return "ordering";
+  }
+
+  if (targetType === "multiple_choice") {
+    return "multiple_choice";
+  }
+
+  if (targetType === "number") {
+    return "number";
+  }
+
   if (targetType === "symbol") {
     return "symbol";
   }
@@ -916,6 +898,20 @@ function buildQuizPrompt(
     );
     instructions.push(
       "Do not add a number, letter, bullet, or punctuation before or after it, and do not paraphrase or shorten it."
+    );
+  } else if (answerMode === "multiple_choice") {
+    instructions.push(
+      "Choose every correct answer from the Choices list below; there may be more than one."
+    );
+    instructions.push(
+      "Copy each selected choice character-for-character and join them on one line with the separator ||. Do not include unselected choices."
+    );
+  } else if (answerMode === "ordering") {
+    instructions.push(
+      "Put every item from the Choices list into the correct order."
+    );
+    instructions.push(
+      "Return every item exactly as written, joined on one line with the separator →. Do not omit or duplicate any item."
     );
   } else if (answerMode === "symbol") {
     instructions.push("Return only the single symbol or operator being asked for, nothing else.");
@@ -1018,9 +1014,22 @@ function buildRequestPlans(
           ? 24
           : 12;
   const numberExpressionBonus = answerMode === "number" ? 48 : 0;
+  const orderingTokenBudget =
+    answerMode === "ordering"
+      ? Math.min(
+          320,
+          32 + Math.ceil(options.join(" ").length / 2)
+        )
+      : 0;
+  const multipleChoiceTokenBudget =
+    answerMode === "multiple_choice"
+      ? Math.min(256, 24 + Math.ceil(options.join(" ").length / 2))
+      : 0;
   const safeMaxTokens = Math.max(
     16,
     maxTokens + numberExpressionBonus,
+    orderingTokenBudget,
+    multipleChoiceTokenBudget,
     hasImages ? IMAGE_QUESTION_MIN_TOKENS : 0
   );
   const effectiveModelPolicy = {
@@ -1617,6 +1626,68 @@ function formatNumericAnswer(value) {
   return text.replace(/(\.\d*?)0+$/, "$1").replace(/\.$/, "");
 }
 
+function extractOrderedOptions(answer, options) {
+  const raw = normalizeText(answer);
+  const cleanedOptions = Array.isArray(options)
+    ? options.map((option) => normalizeText(option)).filter(Boolean)
+    : [];
+  if (!raw || cleanedOptions.length < 2) {
+    return [];
+  }
+
+  const positioned = cleanedOptions.map((option) => ({
+    option,
+    index: raw.indexOf(option),
+  }));
+  if (positioned.some((item) => item.index < 0)) {
+    return [];
+  }
+
+  positioned.sort((left, right) => left.index - right.index);
+  for (let index = 1; index < positioned.length; index += 1) {
+    if (positioned[index - 1].index === positioned[index].index) {
+      return [];
+    }
+  }
+
+  return positioned.map((item) => item.option);
+}
+
+function extractMultipleChoiceOptions(answer, options) {
+  const firstLine = extractFirstLine(answer).replace(
+    /^(?:answer|\u7B54\u3048|\u56DE\u7B54)\s*[:\uFF1A]\s*/i,
+    ""
+  );
+  const cleanedOptions = Array.isArray(options)
+    ? options.map((option) => normalizeText(option)).filter(Boolean)
+    : [];
+  if (!firstLine || !cleanedOptions.length) {
+    return [];
+  }
+
+  const parts = firstLine
+    .split(/\s*(?:\|\||\u2192)\s*/u)
+    .map((part) => normalizeText(part))
+    .filter(Boolean);
+  const selected = [];
+
+  for (const part of parts) {
+    const compactPart = compactText(part);
+    const match = cleanedOptions.find(
+      (option) => compactText(option) === compactPart
+    );
+    if (!match) {
+      return [];
+    }
+    if (selected.includes(match)) {
+      return [];
+    }
+    selected.push(match);
+  }
+
+  return selected;
+}
+
 function sanitizeAnswer(answer, question, options, targetType = "standard") {
   const answerMode = detectAnswerMode(question, options, targetType);
   const rawAnswer = normalizeText(answer);
@@ -1632,6 +1703,16 @@ function sanitizeAnswer(answer, question, options, targetType = "standard") {
   if (answerMode === "choice") {
     const matchedOption = findMatchingOption(rawAnswer, options);
     return matchedOption || firstLine;
+  }
+
+  if (answerMode === "multiple_choice") {
+    const selectedOptions = extractMultipleChoiceOptions(rawAnswer, options);
+    return selectedOptions.length ? selectedOptions.join(" || ") : firstLine;
+  }
+
+  if (answerMode === "ordering") {
+    const orderedOptions = extractOrderedOptions(rawAnswer, options);
+    return orderedOptions.length ? orderedOptions.join(" → ") : firstLine;
   }
 
   if (answerMode === "symbol") {
@@ -1711,6 +1792,14 @@ function isLikelyInvalidAnswer(answer, question, options, targetType = "standard
     return !findMatchingOption(firstLine, options);
   }
 
+  if (answerMode === "multiple_choice") {
+    return extractMultipleChoiceOptions(firstLine, options).length === 0;
+  }
+
+  if (answerMode === "ordering") {
+    return extractOrderedOptions(firstLine, options).length !== options.length;
+  }
+
   if (answerMode === "symbol") {
     return !SYMBOL_ANSWER_PATTERN.test(firstLine);
   }
@@ -1749,10 +1838,6 @@ function getProviderEndpoints(providerId, model = "") {
     return [OPENROUTER_ENDPOINT];
   }
 
-  if (providerId === PROVIDER_CAPI) {
-    return [...CAPI_ENDPOINTS];
-  }
-
   if (providerId === PROVIDER_GEMINI) {
     const modelId = normalizeText(model).replace(/^models\//i, "") || "gemini-2.5-flash";
     return [
@@ -1770,10 +1855,6 @@ function getProviderLabel(providerId) {
 
   if (providerId === PROVIDER_GEMINI) {
     return "Gemini";
-  }
-
-  if (providerId === PROVIDER_CAPI) {
-    return "CAPI";
   }
 
   return "OpenAI";
@@ -1816,8 +1897,6 @@ async function requestChatCompletion(
   const baseMaxTokens =
     providerId === PROVIDER_OPENROUTER
       ? Math.max(48, Number(maxTokens) || 48)
-      : providerId === PROVIDER_CAPI
-        ? Math.max(24, Number(maxTokens) || 24)
       : providerId === PROVIDER_GEMINI
         ? Math.max(64, Number(maxTokens) || 64)
         : Math.max(16, Number(maxTokens) || 16);
@@ -1833,8 +1912,6 @@ async function requestChatCompletion(
     const attemptMaxTokens =
       providerId === PROVIDER_OPENROUTER
         ? Math.min(320, baseMaxTokens * Math.pow(2, attempt))
-        : providerId === PROVIDER_CAPI
-          ? Math.min(256, baseMaxTokens * Math.pow(2, attempt))
         : providerId === PROVIDER_GEMINI
           ? Math.min(512, baseMaxTokens * Math.pow(2, attempt))
           : baseMaxTokens;
@@ -1898,6 +1975,13 @@ async function requestChatCompletion(
     if (providerId === PROVIDER_OPENROUTER && payload) {
       payload.max_completion_tokens = attemptMaxTokens;
       payload.provider = { allow_fallbacks: true };
+    }
+
+    if (providerId === PROVIDER_OPENAI && payload) {
+      delete payload.max_tokens;
+      delete payload.temperature;
+      payload.max_completion_tokens = attemptMaxTokens;
+      payload.reasoning_effort = "none";
     }
 
     let shouldRetryAttempt = false;
@@ -2043,16 +2127,10 @@ async function requestChatCompletion(
             normalizeText(lastError.message)
           )
       );
-      if (authOrConfigError && providerId !== PROVIDER_CAPI) {
+      if (authOrConfigError) {
         break;
       }
     }
-  }
-
-  if (providerId === PROVIDER_CAPI && lastError?.isAuthError) {
-    throw new Error(
-      "CAPI is currently rejecting anonymous requests (401). Switch provider order or try again later."
-    );
   }
 
   // Re-throw the original error object (not a fresh Error) so metadata like
@@ -2094,7 +2172,7 @@ async function buildModelPolicy(providerOrder, credentials) {
   return policy;
 }
 
-async function callCapiChat(
+async function callAiChat(
   question,
   options,
   requestKey = "",
@@ -2828,7 +2906,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       );
       if (!activeProviders.length) {
         throw new Error(
-          "No usable API provider is configured. Enable OpenAI/OpenRouter/Gemini/CAPI and set required API keys in the popup."
+          "No usable API provider is configured. Enable OpenAI/OpenRouter/Gemini and set the required API keys in the popup."
         );
       }
 
@@ -2894,7 +2972,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       }
 
       return enqueueAiRequest(() =>
-        callCapiChat(
+        callAiChat(
           question,
           options,
           requestKey,
@@ -2968,4 +3046,3 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   return true;
 });
-

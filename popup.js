@@ -8,7 +8,7 @@ const DEFAULT_SETTINGS = {
   materialContext: "",
   materialSources: [],
   materialRevision: 0,
-  apiProviders: ["openrouter", "gemini"],
+  apiProviders: ["openai", "gemini", "openrouter"],
   openaiApiKey: "",
   openrouterApiKey: "",
   geminiApiKey: "",
@@ -18,19 +18,20 @@ const DEFAULT_SETTINGS = {
 const PROVIDER_OPENAI = "openai";
 const PROVIDER_OPENROUTER = "openrouter";
 const PROVIDER_GEMINI = "gemini";
-const PROVIDER_CAPI = "capi";
-const DEFAULT_PROVIDER_ORDER = [PROVIDER_GEMINI, PROVIDER_OPENROUTER];
+const DEFAULT_PROVIDER_ORDER = [
+  PROVIDER_OPENAI,
+  PROVIDER_GEMINI,
+  PROVIDER_OPENROUTER,
+];
 const PROVIDER_DISPLAY_NAMES = {
   [PROVIDER_OPENAI]: "OpenAI",
   [PROVIDER_OPENROUTER]: "OpenRouter",
   [PROVIDER_GEMINI]: "Gemini",
-  [PROVIDER_CAPI]: "CAPI",
 };
 const ALL_PROVIDERS = [
   PROVIDER_OPENAI,
   PROVIDER_GEMINI,
   PROVIDER_OPENROUTER,
-  PROVIDER_CAPI,
 ];
 
 const MATERIAL_CONTEXT_LIMIT = 120000;
@@ -64,7 +65,6 @@ const providerListContainer = document.getElementById("providerList");
 const providerOpenAICheckbox = document.getElementById("providerOpenAI");
 const providerOpenRouterCheckbox = document.getElementById("providerOpenRouter");
 const providerGeminiCheckbox = document.getElementById("providerGemini");
-const providerCapiCheckbox = document.getElementById("providerCapi");
 const providerRows = Array.from(document.querySelectorAll("[data-provider-row]"));
 const providerMoveButtons = Array.from(
   document.querySelectorAll("[data-provider-move]")
@@ -94,13 +94,14 @@ function normalizeProviderOrder(value, options = {}) {
     PROVIDER_OPENAI,
     PROVIDER_OPENROUTER,
     PROVIDER_GEMINI,
-    PROVIDER_CAPI,
   ]);
   const seen = new Set();
   const normalized = [];
 
   for (const item of candidates) {
-    const provider = String(item || "").trim().toLowerCase();
+    const storedProvider = String(item || "").trim().toLowerCase();
+    // Migrate installations that had the removed anonymous provider enabled.
+    const provider = storedProvider === "capi" ? PROVIDER_OPENAI : storedProvider;
     if (!allowed.has(provider) || seen.has(provider)) {
       continue;
     }
@@ -390,10 +391,6 @@ function renderProviderPriority() {
   if (providerGeminiCheckbox) {
     providerGeminiCheckbox.checked = selectedSet.has(PROVIDER_GEMINI);
   }
-  if (providerCapiCheckbox) {
-    providerCapiCheckbox.checked = selectedSet.has(PROVIDER_CAPI);
-  }
-
   for (const providerId of orderedDisplayProviders) {
     const row = rowByProvider.get(providerId);
     if (!row) {
@@ -409,9 +406,9 @@ function renderProviderPriority() {
       rankElement.textContent = enabled ? `#${rankIndex + 1}` : "OFF";
     }
 
-    // CAPI needs no key; the others silently drop out of the fallback chain
-    // at request time if their key field is empty, which otherwise looks
-    // like "this provider is just never used" with no visible explanation.
+    // Providers silently drop out of the fallback chain at request time if
+    // their key field is empty, which otherwise looks like "this provider is
+    // just never used" with no visible explanation.
     const warningElement = row.querySelector("[data-provider-warning]");
     if (warningElement) {
       const keyInput =
@@ -471,7 +468,6 @@ function renderApiKeySummary(settings) {
       ? `Gemini key: set (****${geminiKey.slice(-4)})`
       : "Gemini key: not set"
   );
-  lines.push("CAPI key: not required");
   lines.push(`Free API mode: ${settings.freeApiMode ? "ON" : "OFF"}`);
   apiKeyNote.textContent = lines.join("\n");
 }
@@ -580,13 +576,6 @@ if (providerOpenRouterCheckbox) {
 if (providerGeminiCheckbox) {
   providerGeminiCheckbox.addEventListener("change", () => {
     setProviderEnabled(PROVIDER_GEMINI, providerGeminiCheckbox.checked);
-    renderProviderPriority();
-  });
-}
-
-if (providerCapiCheckbox) {
-  providerCapiCheckbox.addEventListener("change", () => {
-    setProviderEnabled(PROVIDER_CAPI, providerCapiCheckbox.checked);
     renderProviderPriority();
   });
 }

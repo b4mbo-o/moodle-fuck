@@ -4,6 +4,9 @@ const STATUS_WIDGET_ID = "moodle-hint-status-widget";
 const PRIMARY_QUESTION_SELECTOR = ".que";
 const FALLBACK_QUESTION_SELECTOR = "[id^='question-']";
 const SUBQUESTION_SELECTOR = ".subquestion";
+const ORDERING_ITEM_SELECTOR = ".answer.ordering [data-itemcontent]";
+const MATCHING_ROW_SELECTOR = ".answer.table-reboot tr";
+const DDWTOS_DROP_SELECTOR = ".qtext .drop[class*='group']";
 const MAX_CONCURRENT_REQUESTS = 2;
 const MAX_IMAGES_PER_QUESTION = 4;
 const MAX_IMAGE_BYTES = 6 * 1024 * 1024;
@@ -156,6 +159,17 @@ function renderNodeText(node, options = {}) {
     if (options.selectCounter) {
       options.selectCounter.value += 1;
       return ` [${options.selectCounter.value}] `;
+    }
+    return blankToken;
+  }
+
+  // Moodle's drag-and-drop-words question type renders blanks as spans
+  // instead of form controls. Treat them exactly like the select-based
+  // missing-word blanks so the model sees their positions.
+  if (element.matches(".drop[class*='group']")) {
+    if (options.blankCounter) {
+      options.blankCounter.value += 1;
+      return ` [${options.blankCounter.value}] `;
     }
     return blankToken;
   }
@@ -517,7 +531,7 @@ function getFallbackRootFromQuestionText(questionNode) {
 function getQuestionRoots() {
   const primaryRoots = Array.from(
     document.querySelectorAll(PRIMARY_QUESTION_SELECTOR)
-  );
+  ).filter((root) => !root.matches(".ordering.dragproxy"));
   if (primaryRoots.length) {
     return primaryRoots;
   }
@@ -580,7 +594,10 @@ function isFormControlFilled(element) {
   }
 
   if (element.tagName === "SELECT") {
-    return Boolean(normalizeText(element.value));
+    const value = normalizeText(element.value);
+    // Moodle matching questions use value="0" for the unselected
+    // "Choose..." entry. Treating it as filled suppresses every hint.
+    return Boolean(value && value !== "0");
   }
 
   if (element.type === "checkbox" || element.type === "radio") {
@@ -661,6 +678,38 @@ function extractOptions(questionRoot) {
   return results;
 }
 
+function getChoiceTargetType(questionRoot) {
+  const answerRoot = questionRoot.querySelector(".answer");
+  if (!answerRoot) {
+    return "";
+  }
+
+  const choiceControls = Array.from(
+    answerRoot.querySelectorAll("input[type='radio'], input[type='checkbox']")
+  ).filter((input) => !input.closest(".qtype_multichoice_clearchoice"));
+  if (!choiceControls.length) {
+    return "";
+  }
+
+  // Numerical questions may render their unit selector as radios alongside a
+  // text input. Those radios are not the answer choices for the question.
+  const hasNonChoiceControl = Boolean(
+    answerRoot.querySelector(
+      "input:not([type='hidden']):not([type='radio']):not([type='checkbox']), textarea, select"
+    )
+  );
+  const isKnownChoiceType = questionRoot.matches(
+    ".multichoice, .truefalse, .calculatedmulti"
+  );
+  if (hasNonChoiceControl && !isKnownChoiceType) {
+    return "";
+  }
+
+  return choiceControls.some((input) => input.type === "checkbox")
+    ? "multiple_choice"
+    : "single_choice";
+}
+
 function getPromptContainer(subquestion) {
   return (
     subquestion.closest("p, li, td, th") ||
@@ -729,6 +778,10 @@ function extractSubquestionOptions(subquestion) {
   }
 
   return Array.from(select.options)
+    .filter((option) => {
+      const value = normalizeText(option.value);
+      return value && value !== "0";
+    })
     .map((option) => normalizeText(option.textContent || option.innerText || ""))
     .filter((optionText) => optionText && optionText !== "-");
 }
@@ -1117,14 +1170,83 @@ function getInlineSelects(container) {
   }
 
   return Array.from(container.querySelectorAll("select")).filter(
-    (select) => !select.closest(SUBQUESTION_SELECTOR)
+    (select) =>
+      Boolean(select.closest(".qtext")) &&
+      !select.closest(SUBQUESTION_SELECTOR)
   );
 }
 
 function extractSelectOptions(select) {
   return Array.from(select.options)
+    .filter((option) => {
+      const value = normalizeText(option.value);
+      return value && value !== "0";
+    })
     .map((option) => normalizeText(option.textContent || option.innerText || ""))
     .filter((optionText) => optionText && optionText !== "-");
+}
+
+function extractOrderingOptions(questionRoot) {
+  return Array.from(questionRoot.querySelectorAll(ORDERING_ITEM_SELECTOR))
+    .map((item) => normalizeText(renderNodeText(item)))
+    .filter(Boolean);
+}
+
+function getMatchingRows(questionRoot) {
+  if (!questionRoot.matches(".match, .randomsamatch")) {
+    return [];
+  }
+
+  return Array.from(questionRoot.querySelectorAll(MATCHING_ROW_SELECTOR))
+    .map((row) => ({
+      row,
+      stem: normalizeText(renderNodeText(row.querySelector("td.text"))),
+      select: row.querySelector("select"),
+    }))
+    .filter((item) => item.stem && item.select);
+}
+
+function buildMatchingMarkedText(questionRoot, rows) {
+  const questionText = extractQuestionText(questionRoot);
+  const stems = rows.map((item, index) => `[${index + 1}] ${item.stem}`);
+  return normalizeText([questionText, ...stems].filter(Boolean).join("\n"));
+}
+
+function getClassNumber(element, prefix) {
+  const className = Array.from(element?.classList || []).find((name) =>
+    new RegExp(`^${prefix}\\d+$`).test(name)
+  );
+  return className ? Number(className.slice(prefix.length)) : 0;
+}
+
+function getDdwtosDrops(questionRoot) {
+  if (!questionRoot.matches(".ddwtos")) {
+    return [];
+  }
+
+  return Array.from(questionRoot.querySelectorAll(DDWTOS_DROP_SELECTOR));
+}
+
+function getDdwtosOptions(questionRoot, drop) {
+  const group = getClassNumber(drop, "group");
+  if (!group) {
+    return [];
+  }
+
+  return Array.from(
+    questionRoot.querySelectorAll(`.answercontainer .draghome.group${group}`)
+  )
+    .map((choice) => normalizeText(renderNodeText(choice)))
+    .filter(Boolean);
+}
+
+function ddwtosHasExistingAnswer(questionRoot) {
+  return Array.from(questionRoot.querySelectorAll("input.placeinput")).some(
+    (input) => {
+      const value = normalizeText(input.value);
+      return Boolean(value && value !== "0");
+    }
+  );
 }
 
 // The whole sentence with every blank numbered [1], [2], ... so the model can
@@ -1157,6 +1279,12 @@ async function extractQuestions() {
   const standardQuestions = [];
 
   for (const questionRoot of getQuestionRoots()) {
+    // Description is an information-only Moodle question type with no
+    // response control. Sending it to an API produces a meaningless hint.
+    if (questionRoot.matches(".description")) {
+      continue;
+    }
+
     if (questionRoot.querySelector(SUBQUESTION_SELECTOR)) {
       continue;
     }
@@ -1164,6 +1292,59 @@ async function extractQuestions() {
     const uniqueId = questionRoot.id || "";
     const container = getImageContainer(questionRoot);
     const inlineSelects = getInlineSelects(container);
+
+    const matchingRows = getMatchingRows(questionRoot);
+    if (matchingRows.length) {
+      const baseText = extractQuestionText(questionRoot);
+      const matchingSelects = matchingRows.map((item) => item.select);
+      gapfillQuestions.push({
+        key: buildQuestionKey(baseText, [], uniqueId) + "#matching",
+        label: getQuestionLabel(questionRoot),
+        questionRoot,
+        questionText: baseText,
+        markedText: buildMatchingMarkedText(questionRoot, matchingRows),
+        options: [],
+        targetType: "gapfill",
+        requestKey: `${uniqueId || baseText}-matching`,
+        uniqueId,
+        blanks: matchingRows.map((item) => ({
+          label: item.stem,
+          options: extractSelectOptions(item.select),
+        })),
+        hasExistingAnswer: anyFormControlFilled(matchingSelects),
+        anchorElement:
+          questionRoot.querySelector(".formulation") ||
+          questionRoot.querySelector(".content") ||
+          questionRoot,
+      });
+      continue;
+    }
+
+    const ddwtosDrops = getDdwtosDrops(questionRoot);
+    if (ddwtosDrops.length) {
+      const baseText = extractQuestionText(questionRoot);
+      gapfillQuestions.push({
+        key: buildQuestionKey(baseText, [], uniqueId) + "#ddwtos",
+        label: getQuestionLabel(questionRoot),
+        questionRoot,
+        questionText: baseText,
+        markedText: buildMultiBlankMarkedText(container),
+        options: [],
+        targetType: "gapfill",
+        requestKey: `${uniqueId || baseText}-ddwtos`,
+        uniqueId,
+        blanks: ddwtosDrops.map((drop, index) => ({
+          label: `空白${index + 1}`,
+          options: getDdwtosOptions(questionRoot, drop),
+        })),
+        hasExistingAnswer: ddwtosHasExistingAnswer(questionRoot),
+        anchorElement:
+          questionRoot.querySelector(".formulation") ||
+          questionRoot.querySelector(".content") ||
+          questionRoot,
+      });
+      continue;
+    }
 
     if (inlineSelects.length) {
       const baseText = extractQuestionText(questionRoot);
@@ -1192,14 +1373,27 @@ async function extractQuestions() {
       continue;
     }
 
-    const options = extractOptions(questionRoot);
+    const orderingOptions = extractOrderingOptions(questionRoot);
+    const choiceTargetType = getChoiceTargetType(questionRoot);
+    const options = orderingOptions.length
+      ? orderingOptions
+      : choiceTargetType
+        ? extractOptions(questionRoot)
+        : [];
+    const targetType = orderingOptions.length
+      ? "ordering"
+      : choiceTargetType === "multiple_choice"
+        ? "multiple_choice"
+        : questionRoot.matches(".numerical, .calculated, .calculatedsimple")
+          ? "number"
+          : "standard";
     standardQuestions.push({
       key: buildQuestionKey(questionText, options, uniqueId),
       label: getQuestionLabel(questionRoot),
       questionRoot,
       questionText,
       options,
-      targetType: "standard",
+      targetType,
       requestKey: questionRoot.id || questionText,
       uniqueId,
       hasExistingAnswer: answerRootHasExistingAnswer(questionRoot),
@@ -2097,4 +2291,3 @@ if (document.body) {
 }
 
 scheduleScan();
-

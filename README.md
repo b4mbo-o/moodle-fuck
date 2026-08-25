@@ -1,13 +1,14 @@
 # MoodleFuck
 
 Chrome 拡張で Moodle の穴埋め/選択問題のヒント生成を支援するツールです。  
-現在は複数API（OpenRouter / Gemini / OpenAI / CAPI）に対応しています。
+現在は複数API（OpenAI / Gemini / OpenRouter）に対応しています。
 
-## 現在の動作（2026-05 時点）
+## 現在の動作（2026-08 時点）
 
 ### 1. モデル選択とフォールバック
 
-- デフォルトの優先順は `Gemini -> OpenRouter`（Gemini の無料枠を先に使い、尽きたら OpenRouter の有料枠へ）。popup で既に並び順を保存済みのユーザーはそのまま維持される。
+- デフォルトの優先順は `OpenAI -> Gemini -> OpenRouter`。キー未設定のプロバイダは自動でスキップされる。廃止済みプロバイダを含む保存設定は、その位置を OpenAI に置き換えて移行する。
+- OpenAI 公式 API では、データ共有特典へオプトイン済みの対象アカウントで無料トークン対象となる `gpt-5.6-luna` を先に使用し、通信失敗または回答検証失敗時に `gpt-5.6-terra` へフォールバックする。
 - OpenRouter では Gemini 系モデルを使用（`google/gemini-2.5-flash-lite` -> `google/gemini-2.5-flash` -> `google/gemini-2.0-flash-001` -> `google/gemini-2.0-flash-lite-001`）。
 - Free API Mode が ON の場合は、OpenRouter の `:free` モデルを先に試してから Gemini 系モデルへフォールバック。
 - Detailed Mode / 資料優先モードでは `google/gemini-2.5-pro` -> `google/gemini-2.5-flash` -> `google/gemini-2.5-flash-lite` の順で使用。
@@ -77,12 +78,85 @@ Chrome 拡張で Moodle の穴埋め/選択問題のヒント生成を支援す�
 - API プロバイダは複数選択・優先順位入れ替え可能。
 - プロバイダのフォールバック発生（例: Geminiが失敗してOpenRouterに切り替わった）は、ヒントパネルには表示せず、popup 内の折りたたみ式「Logs」セクション（デフォルトは非表示、クリックで展開）に記録される。最大50件、「Clear Logs」で削除可能。
 
+### 11. Moodle本体との互換性
+
+[Moodle公式リポジトリ](https://github.com/moodle/moodle) の `main` ブランチ（確認時: `6216fe4`）にある問題レンダラーとテンプレートを基準に、生成されるDOMへ追従しています。
+
+- 情報表示だけの `description` は問題としてAPIへ送らない。
+- `match` / `randomsamatch` の表形式マッチング問題を、行ごとの複数空欄としてまとめて処理する。
+- `gapselect` に加え、`ddwtos`（文中へのドラッグ＆ドロップ）の空欄とグループ別候補を処理する。
+- `ordering` の並べ替え項目を抽出し、全項目を正しい順番で返す。ドラッグ中だけ作られる複製DOMは問題として数えない。
+- `multichoice` のcheckboxを複数回答として判定し、正解候補をすべて返す。radioの単一回答とは別の出力検証を行う。
+- `numerical` / `calculated` の単位radio/selectを通常の選択肢と誤認しない。数値回答は数値モードで処理する。
+- Moodleの未選択selectで使われる値 `0` は「回答済み」と判定せず、プレースホルダーも選択肢から除外する。
+
+確認に使った主な公式実装: [question engine renderer](https://github.com/moodle/moodle/blob/6216fe4ed19a5a3c88c0951d1647e9f2d626bcbb/public/question/engine/renderer.php)、[multichoice renderer](https://github.com/moodle/moodle/blob/6216fe4ed19a5a3c88c0951d1647e9f2d626bcbb/public/question/type/multichoice/renderer.php)、[matching renderer](https://github.com/moodle/moodle/blob/6216fe4ed19a5a3c88c0951d1647e9f2d626bcbb/public/question/type/match/renderer.php)、[numerical renderer](https://github.com/moodle/moodle/blob/6216fe4ed19a5a3c88c0951d1647e9f2d626bcbb/public/question/type/numerical/renderer.php)。
+
+Moodleの追加プラグイン問題タイプやサイト独自テーマはDOMが異なる場合があります。画像上へ直接配置する `ddimageortext` / `ddmarker` は、現時点では画像をAIへ添付できますが、配置座標を専用形式で解析する機能は未対応です。
+
 ## 対応プロバイダ
 
 - OpenRouter（APIキー必要）
 - Gemini（APIキー必要）
 - OpenAI（APIキー必要）
-- CAPI `https://capi.voids.top/v2`（キー不要設定だが、状況により 401/404 の可能性あり）
+
+## 無料枠を活用する運用
+
+料金・対象モデル・レート制限は変更されることがあるため、以下は **2026年8月時点** の情報です。利用前に各リンク先とダッシュボードの表示も確認してください。
+
+| 運用 | 初期支払い | 向いている用途 | 主な制限・注意 |
+| --- | ---: | --- | --- |
+| OpenRouter完全無料 | $0 | 少量利用、試用 | 無課金アカウントは無料モデル合計50リクエスト/日が目安。混雑やモデル停止で失敗することがある |
+| OpenAIデータ共有特典 | 最小$5 | 速度・品質・安定性を重視 | 対象組織のみ。Tier 1–2ではLuna/Terraなどのグループ合計250万token/日。超過分は通常課金 |
+| OpenRouter → OpenAI | $5 | 無料モデルを先に使い、失敗時だけOpenAIへ移る | OpenAI側の無料トークン超過時は購入残高から課金される |
+
+### 完全無料で使う: OpenRouter
+
+1. [OpenRouter](https://openrouter.ai/) でアカウントとAPIキーを作成する。クレジット購入は不要。
+2. popupのプロバイダは **OpenRouterだけ** をONにする。
+3. `Free API Mode` をONにしてAPI設定を保存する。
+4. OpenRouterに有料クレジットを入れず、自動チャージも設定しない。これで有料候補へ到達しても残高不足で停止するため、実費は発生しない。
+
+OpenRouterの `:free` モデルはprompt/completionとも$0ですが、無課金または購入額$10未満のアカウントは無料モデル全体で通常50リクエスト/日です。$10以上のクレジットを購入したアカウントは通常1,000リクエスト/日に増えますが、購入クレジットは有料モデルにも使えるため「完全無料」の安全性は下がります。無料モデルは低レートで、提供モデルや空き状況も変動します。
+
+- [OpenRouter FAQ（無料モデルとレート制限）](https://openrouter.ai/docs/faq)
+- [OpenRouter Free Models Router](https://openrouter.ai/openrouter/free/)
+
+### 最小$5でOpenAIの無料トークン特典を使う
+
+OpenAIには、APIの入出力をモデル改善目的で共有する対象組織向けに、日次のcomplimentary tokens（無料トークン）が付く制度があります。この拡張が使う `gpt-5.6-luna` と `gpt-5.6-terra` は同じ対象グループです。
+
+1. [OpenAI API Platform](https://platform.openai.com/) でAPI組織とプロジェクトを作成する。
+2. Billingでプリペイドクレジットを購入する。公式の最低購入額は **$5**。
+3. 意図しない追加購入を防ぐ場合は、初期設定時に `Auto Recharge` をOFFにする。
+4. Organization OwnerでData controlsを開き、`Share inputs and outputs with OpenAI` に無料利用対象の表示があることを確認する。
+5. 全プロジェクトまたは拡張用プロジェクトだけデータ共有を有効にする。
+6. そのプロジェクトでAPIキーを作成し、popupのOpenAI欄へ保存する。
+7. Usage Dashboardでservice tierを確認し、`data sharing incentive tier` として記録されていることを確認する。
+
+Tier 1–2の対象アカウントでは、Luna/Terraを含むグループで **合計250万token/日** が無料対象です。枠は毎日00:00 UTC（日本時間09:00）にリセットされます。残り枠を1回のリクエストが超える場合、そのリクエスト全体が通常課金になります。対象外の組織、共有していないプロジェクト、ツール利用、上限超過分も通常課金です。また、制度の利用には正のアカウント残高が必要です。
+
+通常課金になった場合の現行テキスト料金は次のとおりです（100万tokenあたり）。
+
+| モデル | 入力 | キャッシュ入力 | 出力 | 拡張内の役割 |
+| --- | ---: | ---: | ---: | --- |
+| `gpt-5.6-luna` | $0.20 | $0.02 | $1.20 | 高速な第一候補 |
+| `gpt-5.6-terra` | $2.00 | $0.20 | $12.00 | Luna失敗時の上位フォールバック |
+
+- [OpenAIのデータ共有とcomplimentary tokens](https://help.openai.com/en/articles/10306912-sharing-feedback-evaluation-and-fine-tuning-data-and-api-inputs-and-outputs-with-openai)
+- [OpenAIのプリペイド課金](https://help.openai.com/en/articles/8264778)
+- [OpenAIの現行モデル一覧](https://developers.openai.com/api/docs/models)
+
+> [!IMPORTANT]
+> 「$5を一度払えば永久に無料」ではありません。購入クレジットは1年で失効し返金不可です。無料トークン制度も30日前の通知で終了する可能性があり、対象条件やモデルは変更されます。正確には「最小$5の残高を用意し、対象期間・日次上限内で長期間ほぼ無料を狙う運用」です。
+
+### 無料枠をできるだけ先に使う推奨順
+
+- 絶対に課金したくない: `OpenRouter` のみ、`Free API Mode` ON、OpenRouter残高$0。
+- 無料優先で成功率も上げたい: `OpenRouter -> OpenAI`、`Free API Mode` ON。OpenAIの日次枠超過時は課金され得る。
+- 速度と回答品質を優先: `OpenAI -> OpenRouter`。OpenAIはLunaから始まり、失敗時にTerraへ移る。
+
+データ共有を有効にすると、この拡張から送信される問題文、選択肢、添付画像、投入した資料の関連部分が共有対象になり得ます。個人情報、機密情報、第三者の非公開資料は送信しないでください。
 
 ## ファイル構成
 

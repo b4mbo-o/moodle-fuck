@@ -2,13 +2,12 @@
   "manifest_version": 3,
   "name": "MoodleFuck",
   "version": "1.0",
-  "description": "Moodle quiz helper using OpenAI, OpenRouter, Gemini, and CAPI APIs.",
+  "description": "Moodle quiz helper using OpenAI, OpenRouter, and Gemini APIs.",
   "permissions": ["activeTab", "scripting", "storage"],
   "host_permissions": [
     "https://api.openai.com/*",
     "https://openrouter.ai/*",
-    "https://generativelanguage.googleapis.com/*",
-    "https://capi.voids.top/*"
+    "https://generativelanguage.googleapis.com/*"
   ],
   "action": {
     "default_popup": "popup.html",
