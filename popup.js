@@ -5,6 +5,7 @@ const DEFAULT_SETTINGS = {
   showStatusWidget: true,
   materialMode: false,
   freeApiMode: false,
+  openaiModelMode: "auto",
   materialContext: "",
   materialSources: [],
   materialRevision: 0,
@@ -55,6 +56,7 @@ const enabledToggle = document.getElementById("enabledToggle");
 const detailedToggle = document.getElementById("detailedToggle");
 const statusWidgetToggle = document.getElementById("statusWidgetToggle");
 const materialModeToggle = document.getElementById("materialModeToggle");
+const openaiModelModeSelect = document.getElementById("openaiModelMode");
 const freeApiModeToggle = document.getElementById("freeApiModeToggle");
 const materialsInput = document.getElementById("materialsInput");
 const materialsText = document.getElementById("materialsText");
@@ -137,6 +139,7 @@ function normalizeSettings(raw = {}) {
     showStatusWidget: raw.showStatusWidget !== false,
     materialMode: Boolean(raw.materialMode),
     freeApiMode: Boolean(raw.freeApiMode),
+    openaiModelMode: ["auto", "speed", "quality", "sol"].includes(raw.openaiModelMode) ? raw.openaiModelMode : "auto",
     materialContext: typeof raw.materialContext === "string" ? raw.materialContext : "",
     materialSources,
     materialRevision: Number(raw.materialRevision) || 0,
@@ -480,6 +483,7 @@ function render(settings) {
   if (freeApiModeToggle) {
     freeApiModeToggle.checked = settings.freeApiMode;
   }
+  openaiModelModeSelect.value = settings.openaiModelMode;
   providerOrderDraft = normalizeProviderOrder(settings.apiProviders);
   openaiApiKeyInput.value = settings.openaiApiKey || "";
   openrouterApiKeyInput.value = settings.openrouterApiKey || "";
@@ -541,6 +545,10 @@ statusWidgetToggle.addEventListener("change", async () => {
     showStatusWidget: statusWidgetToggle.checked,
   });
   await refresh();
+});
+
+openaiModelModeSelect.addEventListener("change", async () => {
+  await saveSettings({ openaiModelMode: openaiModelModeSelect.value });
 });
 
 if (freeApiModeToggle) {
@@ -840,6 +848,7 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
     "detailedMode",
     "showStatusWidget",
     "freeApiMode",
+    "openaiModelMode",
     "materialMode",
     "materialContext",
     "materialSources",

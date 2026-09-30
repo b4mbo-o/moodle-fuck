@@ -10,6 +10,7 @@ const DDWTOS_DROP_SELECTOR = ".qtext .drop[class*='group']";
 const MAX_CONCURRENT_REQUESTS = 2;
 const MAX_IMAGES_PER_QUESTION = 4;
 const MAX_IMAGE_BYTES = 6 * 1024 * 1024;
+const MAX_IMAGE_DATA_URL_LENGTH = 8 * 1024 * 1024;
 
 const answerCache = new Map();
 const imageDataUrlCache = new Map();
@@ -36,6 +37,7 @@ const DEFAULT_SETTINGS = {
   showStatusWidget: true,
   materialMode: false,
   freeApiMode: false,
+  openaiModelMode: "auto",
   materialRevision: 0,
 };
 
@@ -57,6 +59,7 @@ function normalizeSettings(raw = {}) {
     showStatusWidget: raw.showStatusWidget !== false,
     materialMode: Boolean(raw.materialMode),
     freeApiMode: Boolean(raw.freeApiMode),
+    openaiModelMode: ["auto", "speed", "quality", "sol"].includes(raw.openaiModelMode) ? raw.openaiModelMode : "auto",
     materialRevision: Number(raw.materialRevision) || 0,
   };
 }
@@ -67,6 +70,7 @@ function getRequestCacheKey(question, settings = currentSettings) {
     detailedMode: Boolean(settings.detailedMode),
     materialMode: Boolean(settings.materialMode),
     freeApiMode: Boolean(settings.freeApiMode),
+    openaiModelMode: settings.openaiModelMode,
     materialRevision: Number(settings.materialRevision) || 0,
   });
 }
@@ -971,16 +975,11 @@ function extractSubquestions() {
     })
     .filter(Boolean);
 
-  // When a question root has several related free-text blanks (e.g. a
-  // multi-part physics problem with I, I1, I2, V3...), solve them jointly in
-  // one request instead of one isolated request per blank. Isolated requests
-  // can't stay consistent with each other (e.g. re-deriving a different
-  // circuit topology for each current, or forgetting a later part builds on
-  // an earlier one).
+  // Solve related blanks jointly in one request, including dropdown groups.
+  // An isolated dropdown answer may be a valid option but belong to a
+  // different numbered blank in the same passage.
   for (const [questionRoot, group] of blanksByRoot) {
-    if (group.length < 2 || group.some((blank) => blank.options.length)) {
-      // Groups with dropdown options (e.g. matching-type subquestions) keep
-      // using the existing independent per-blank flow.
+    if (group.length < 2) {
       continue;
     }
 
@@ -1013,7 +1012,11 @@ function extractSubquestions() {
         nameOccurrence.set(baseName, occurrence);
         label = `${baseName} (occurrence ${occurrence} of ${nameCounts.get(baseName)})`;
       }
-      return { label, fieldType: blank.targetType };
+      return {
+        label,
+        fieldType: blank.targetType,
+        options: blank.options,
+      };
     });
     const groupRequestKey = `${group[0].uniqueId}-group`;
     // These are solved together in one request, so if any sibling already
@@ -1123,6 +1126,12 @@ async function extractQuestionImages(container) {
 
     try {
       const dataUrl = await getImageDataUrl(url);
+      // Keep this aligned with background.js so an image counted here is
+      // actually eligible for attachment to the model request.
+      if (!/^data:image\/[^;,]+;base64,/i.test(dataUrl) ||
+          dataUrl.length > MAX_IMAGE_DATA_URL_LENGTH) {
+        throw new Error(`Unsupported or oversized image: ${url}`);
+      }
       images.push({ url, dataUrl });
     } catch (error) {
       console.warn("Failed to load question image:", url, error);
@@ -1639,6 +1648,7 @@ function parseAnswerText(answerPayload) {
   // popup's Logs panel instead of cluttering every hint with them.
   return {
     answer,
+    fillAnswer: answer,
     reason: expression ? `式: ${expression}` : "",
     meta:
       modelName && providerName
@@ -1853,6 +1863,7 @@ async function resolveGapfillAnswers(question) {
 
   return {
     answer: lines.join("\n"),
+    fillAnswers: result.answers,
     reason: "",
     meta,
   };
@@ -1862,9 +1873,11 @@ function getGroupRequestCacheKey(question, settings = currentSettings) {
   return JSON.stringify({
     groupKey: question.groupRequestKey || question.groupMarkedText,
     markedText: question.groupMarkedText,
+    blanks: question.groupBlanks,
     detailedMode: Boolean(settings.detailedMode),
     materialMode: Boolean(settings.materialMode),
     freeApiMode: Boolean(settings.freeApiMode),
+    openaiModelMode: settings.openaiModelMode,
     materialRevision: Number(settings.materialRevision) || 0,
     imageUrls: (question.images || []).map((image) => image.url),
   });
@@ -1946,6 +1959,7 @@ async function resolveGroupBlankAnswer(question) {
 
   return {
     answer,
+    fillAnswer: item?.valid === false ? "" : answer,
     reason: expression ? `式: ${expression}` : "",
     meta:
       model && provider
@@ -1956,6 +1970,100 @@ async function resolveGroupBlankAnswer(question) {
             ? `Provider: ${provider}`
             : "",
   };
+}
+
+function answerControls(questionRoot) {
+  const answerRoot = questionRoot?.querySelector(".answer");
+  if (!answerRoot) return [];
+  return Array.from(answerRoot.querySelectorAll("input, textarea, select"))
+    .filter((control) => !control.closest(".qtype_multichoice_clearchoice"));
+}
+
+function isEditableAnswerControl(control) {
+  return control && control.isConnected && !control.disabled && !control.readOnly;
+}
+
+function chooseExactOption(select, answer) {
+  if (!isEditableAnswerControl(select) || isFormControlFilled(select)) return false;
+  const matches = Array.from(select.options).filter((option) =>
+    normalizeText(option.textContent || option.innerText) === normalizeText(answer) &&
+    normalizeText(option.value) && normalizeText(option.value) !== "0" &&
+    !option.disabled
+  );
+  if (matches.length !== 1) return false;
+  select.value = matches[0].value;
+  select.dispatchEvent(new Event("input", { bubbles: true }));
+  select.dispatchEvent(new Event("change", { bubbles: true }));
+  return true;
+}
+
+function choiceLabelText(control) {
+  const row = control.closest(".r0, .r1, .answer > div");
+  const label = row?.querySelector("[data-region='answer-label']") ||
+    (control.id ? document.querySelector(`label[for="${CSS.escape(control.id)}"]`) : null) ||
+    row?.querySelector("label");
+  return normalizeText(label?.innerText || label?.textContent || "");
+}
+
+function applyChoiceAnswer(question, answer) {
+  const controls = answerControls(question.questionRoot).filter((control) =>
+    isEditableAnswerControl(control) && ["radio", "checkbox"].includes(control.type)
+  );
+  if (!controls.length || controls.some((control) => control.checked)) return false;
+  const selected = question.targetType === "multiple_choice"
+    ? answer.split(/\s*\|\|\s*/).map(normalizeText).filter(Boolean)
+    : [normalizeText(answer)];
+  if (!selected.length || new Set(selected).size !== selected.length) return false;
+  const matches = selected.map((text) =>
+    controls.filter((control) => choiceLabelText(control) === text)
+  );
+  if (matches.some((items) => items.length !== 1)) return false;
+  if (question.targetType !== "multiple_choice" && matches[0][0].type !== "radio") return false;
+  for (const [index, items] of matches.entries()) {
+    if (index === 0 || question.targetType === "multiple_choice") items[0].click();
+  }
+  return true;
+}
+
+function writeTextAnswer(control, answer) {
+  if (!isEditableAnswerControl(control) || isFormControlFilled(control)) return false;
+  if (!control.matches("textarea, input[type='text'], input[type='number'], input:not([type])")) return false;
+  const value = normalizeText(answer);
+  if (!value) return false;
+  control.value = value;
+  if (control.value !== value) return false;
+  control.dispatchEvent(new Event("input", { bubbles: true }));
+  control.dispatchEvent(new Event("change", { bubbles: true }));
+  return true;
+}
+
+function hasUnsentQuestionImage(question) {
+  const imageElements = collectQuestionImageElements(getImageContainer(question.questionRoot));
+  return imageElements.length > (question.images || []).length;
+}
+
+function applyGeneratedAnswer(question, parsed) {
+  if (hasUnsentQuestionImage(question)) return false;
+  if (question.blanks?.length) {
+    // Moodle drag-and-drop uses its own state machine; only native selects are set here.
+    const selects = question.questionRoot.matches(".match, .randomsamatch")
+      ? getMatchingRows(question.questionRoot).map((row) => row.select)
+      : getInlineSelects(getImageContainer(question.questionRoot));
+    if (selects.length !== question.blanks.length) return false;
+    return parsed.fillAnswers?.reduce((count, item, index) =>
+      count + Number(item?.valid && chooseExactOption(selects[index], item.answer)), 0) > 0;
+  }
+  if (!parsed.fillAnswer || question.targetType === "ordering") return false;
+  if (question.groupMarkedText || question.inputElement) {
+    const control = question.inputElement;
+    if (control?.tagName === "SELECT") return chooseExactOption(control, parsed.fillAnswer);
+    return writeTextAnswer(control, parsed.fillAnswer);
+  }
+  if (question.options.length) return applyChoiceAnswer(question, parsed.fillAnswer);
+  const textControls = answerControls(question.questionRoot).filter((control) =>
+    control.matches("textarea, input[type='text'], input[type='number'], input:not([type])")
+  );
+  return textControls.length === 1 && writeTextAnswer(textControls[0], parsed.fillAnswer);
 }
 
 async function hydratePanel(question, panel, options = {}) {
@@ -1996,13 +2104,16 @@ async function hydratePanel(question, panel, options = {}) {
       parsed = parseAnswerText(await requestAnswer(question));
     }
 
+    const imageMissing = hasUnsentQuestionImage(question);
+    const filled = !isPaused(currentSettings) && applyGeneratedAnswer(question, parsed);
+
     panel.dataset.loadedKey = loadKey;
     runtimeState.readyCount += 1;
     updatePanel(panel, {
       state: "ready",
-      status: "Ready",
+      status: filled ? "Entered" : "Ready",
       answer: parsed.answer,
-      reason: parsed.reason,
+      reason: [parsed.reason, imageMissing ? "画像未送信のため自動入力を保留" : ""].filter(Boolean).join(" / "),
       meta: parsed.meta,
     });
     if (!isPaused(currentSettings)) {
@@ -2195,7 +2306,8 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
     nextSettings.materialMode !== currentSettings.materialMode ||
     nextSettings.materialRevision !== currentSettings.materialRevision;
   const apiModeChanged =
-    nextSettings.freeApiMode !== currentSettings.freeApiMode;
+    nextSettings.freeApiMode !== currentSettings.freeApiMode ||
+    nextSettings.openaiModelMode !== currentSettings.openaiModelMode;
   const availabilityChanged =
     nextSettings.enabled !== currentSettings.enabled ||
     nextSettings.pausedUntil !== currentSettings.pausedUntil;
