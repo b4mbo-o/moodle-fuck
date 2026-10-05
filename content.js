@@ -146,11 +146,15 @@ function renderNodeText(node, options = {}) {
   const element = node;
 
   if (
-    element.matches(".accesshide, .sr-only, script, style, label.subq") ||
+    element.matches(".accesshide, .sr-only, script, style, label.subq, input[type='hidden']") ||
     element.matches(".moodle-hint-anchor") ||
     element.matches(`#${STATUS_WIDGET_ID}`)
   ) {
     return "";
+  }
+
+  if (options.blankIndexes?.has(element)) {
+    return ` [${options.blankIndexes.get(element)}] `;
   }
 
   // Inline dropdowns (gapselect). When a target is set, mark it as [blank] and
@@ -601,7 +605,7 @@ function isFormControlFilled(element) {
     const value = normalizeText(element.value);
     // Moodle matching questions use value="0" for the unselected
     // "Choose..." entry. Treating it as filled suppresses every hint.
-    return Boolean(value && value !== "0");
+    return Boolean(value && (value !== "0" || element.closest(SUBQUESTION_SELECTOR)));
   }
 
   if (element.type === "checkbox" || element.type === "radio") {
@@ -781,13 +785,7 @@ function extractSubquestionOptions(subquestion) {
     return [];
   }
 
-  return Array.from(select.options)
-    .filter((option) => {
-      const value = normalizeText(option.value);
-      return value && value !== "0";
-    })
-    .map((option) => normalizeText(option.textContent || option.innerText || ""))
-    .filter((optionText) => optionText && optionText !== "-");
+  return extractSelectOptions(select);
 }
 
 function extractTextAroundSubquestion(promptContainer, subquestion) {
@@ -847,6 +845,11 @@ function guessBlankVariableName(before) {
 }
 
 function inferSubquestionFieldInfo(questionRoot, promptContainer, subquestion, index) {
+  // Instructions in comments apply to their code blank, not every blank in
+  // the enclosing <code>. Keep identifiers/operators verbatim as code answers.
+  if (subquestion.closest("pre, code")) {
+    return { type: "code", label: `Blank ${index}`, variableName: "" };
+  }
   const { before, after } = extractTextAroundSubquestion(promptContainer, subquestion);
   // The instruction that determines symbol/katakana requirements (e.g.
   // "カタカナで...答えよ") often sits in an earlier paragraph outside this
@@ -917,6 +920,10 @@ function extractSubquestions() {
 
   const blanks = Array.from(document.querySelectorAll(SUBQUESTION_SELECTOR))
     .map((subquestion) => {
+      const inputElement = subquestion.querySelector(
+        "input:not([type='hidden']), textarea, select"
+      );
+      if (!inputElement) return null;
       const questionRoot = getOwningQuestionRoot(subquestion);
       if (!questionRoot) {
         return null;
@@ -937,9 +944,6 @@ function extractSubquestions() {
         return null;
       }
 
-      const inputElement = subquestion.querySelector(
-        "input:not([type='hidden']), textarea, select"
-      );
       const uniqueId =
         inputElement?.id ||
         inputElement?.name ||
@@ -957,7 +961,8 @@ function extractSubquestions() {
         questionRoot,
         questionText,
         options,
-        anchorElement: promptContainer,
+        anchorElement: subquestion.closest("pre") || promptContainer,
+        blankElement: subquestion,
         targetType: fieldInfo.type,
         fieldLabel: fieldInfo.label,
         requestKey: uniqueId,
@@ -990,7 +995,7 @@ function extractSubquestions() {
       continue;
     }
 
-    const markedText = buildMultiBlankMarkedText(formulation);
+    const markedText = buildMultiBlankMarkedText(formulation, group.map((blank) => blank.blankElement));
     if (!markedText) {
       continue;
     }
@@ -1019,9 +1024,9 @@ function extractSubquestions() {
       };
     });
     const groupRequestKey = `${group[0].uniqueId}-group`;
-    // These are solved together in one request, so if any sibling already
-    // has an answer, treat the whole group as already attempted.
-    const groupHasExistingAnswer = group.some((blank) => blank.hasExistingAnswer);
+    // A partial attempt still needs hints for its remaining blanks. Existing
+    // values are protected again when the response is applied.
+    const groupHasExistingAnswer = group.every((blank) => blank.hasExistingAnswer);
 
     group.forEach((blank, index) => {
       blank.groupMarkedText = markedText;
@@ -1189,7 +1194,8 @@ function extractSelectOptions(select) {
   return Array.from(select.options)
     .filter((option) => {
       const value = normalizeText(option.value);
-      return value && value !== "0";
+      return !option.disabled && value &&
+        (value !== "0" || select.closest(SUBQUESTION_SELECTOR));
     })
     .map((option) => normalizeText(option.textContent || option.innerText || ""))
     .filter((optionText) => optionText && optionText !== "-");
@@ -1270,9 +1276,11 @@ function buildGapfillMarkedText(container) {
 // document order, so a multi-part problem (e.g. several related physics
 // answers) can be solved jointly with shared, consistent reasoning instead
 // of re-deriving each value from scratch in an isolated request.
-function buildMultiBlankMarkedText(formulation) {
+function buildMultiBlankMarkedText(formulation, blankElements = null) {
   return normalizeText(
-    renderNodeText(formulation, { blankCounter: { value: 0 } })
+    renderNodeText(formulation, blankElements
+      ? { blankIndexes: new Map(blankElements.map((element, index) => [element, index + 1])) }
+      : { blankCounter: { value: 0 } })
   );
 }
 
@@ -1320,7 +1328,7 @@ async function extractQuestions() {
           label: item.stem,
           options: extractSelectOptions(item.select),
         })),
-        hasExistingAnswer: anyFormControlFilled(matchingSelects),
+        hasExistingAnswer: matchingSelects.every(isFormControlFilled),
         anchorElement:
           questionRoot.querySelector(".formulation") ||
           questionRoot.querySelector(".content") ||
@@ -1368,7 +1376,7 @@ async function extractQuestions() {
         requestKey: uniqueId || baseText,
         uniqueId,
         blanks: buildGapfillBlanks(inlineSelects),
-        hasExistingAnswer: anyFormControlFilled(inlineSelects),
+        hasExistingAnswer: inlineSelects.every(isFormControlFilled),
         anchorElement:
           questionRoot.querySelector(".formulation") ||
           questionRoot.querySelector(".content") ||
@@ -1418,7 +1426,13 @@ async function extractQuestions() {
     ...standardQuestions,
     ...gapfillQuestions,
     ...subquestions,
-  ];
+  ].sort((left, right) => {
+    const leftNode = left.blankElement || left.questionRoot;
+    const rightNode = right.blankElement || right.questionRoot;
+    const position = leftNode.compareDocumentPosition(rightNode);
+    return position & Node.DOCUMENT_POSITION_FOLLOWING ? -1
+      : position & Node.DOCUMENT_POSITION_PRECEDING ? 1 : 0;
+  });
   await attachQuestionImages(questions);
   return questions;
 }
@@ -1475,7 +1489,13 @@ function ensurePanel(question) {
     question.questionRoot;
 
   if (anchorTarget?.parentNode) {
-    anchorTarget.insertAdjacentElement("afterend", anchor);
+    // Multiple blanks may share one paragraph/code block. Appending after
+    // the previous panel keeps the same order as the response controls.
+    let insertionTarget = anchorTarget;
+    while (insertionTarget.nextElementSibling?.matches(".moodle-hint-anchor")) {
+      insertionTarget = insertionTarget.nextElementSibling;
+    }
+    insertionTarget.insertAdjacentElement("afterend", anchor);
   } else if (question.questionRoot) {
     question.questionRoot.appendChild(anchor);
   }
@@ -1987,7 +2007,8 @@ function chooseExactOption(select, answer) {
   if (!isEditableAnswerControl(select) || isFormControlFilled(select)) return false;
   const matches = Array.from(select.options).filter((option) =>
     normalizeText(option.textContent || option.innerText) === normalizeText(answer) &&
-    normalizeText(option.value) && normalizeText(option.value) !== "0" &&
+    normalizeText(option.value) &&
+    (normalizeText(option.value) !== "0" || select.closest(SUBQUESTION_SELECTOR)) &&
     !option.disabled
   );
   if (matches.length !== 1) return false;

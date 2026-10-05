@@ -849,6 +849,10 @@ function detectAnswerMode(question, options, targetType = "standard") {
     return "name";
   }
 
+  if (targetType === "code" && !options?.length) {
+    return "short";
+  }
+
   if (Array.isArray(options) && options.length) {
     return "choice";
   }
@@ -2426,7 +2430,7 @@ function buildGapfillPrompt(markedText, blanks, materialContext = "") {
   ].join("\n");
 }
 
-function parseGapfillAnswers(rawText, blanks) {
+function parseNumberedAnswerMap(rawText, blankCount) {
   const byIndex = new Map();
 
   for (const rawLine of String(rawText || "").split(/\r?\n/)) {
@@ -2437,12 +2441,18 @@ function parseGapfillAnswers(rawText, blanks) {
     }
 
     const index = Number(match[1]) - 1;
-    if (index < 0 || index >= blanks.length || byIndex.has(index)) {
-      continue;
-    }
+    // Conflicting/out-of-range numbers make the mapping ambiguous. Reject
+    // it so another model can retry; never shift answers to neighboring fields.
+    if (index < 0 || index >= blankCount || byIndex.has(index)) return new Map();
 
     byIndex.set(index, match[2]);
   }
+
+  return byIndex;
+}
+
+function parseGapfillAnswers(rawText, blanks) {
+  const byIndex = parseNumberedAnswerMap(rawText, blanks.length);
 
   return blanks.map((blank, index) => {
     const rawAnswer = byIndex.get(index) || "";
@@ -2718,73 +2728,9 @@ function buildMultiBlankAnswersFromMap(byIndex, blanks, markedText) {
 }
 
 function parseMultiBlankAnswers(rawText, blanks, markedText) {
-  const numberedLines = [];
-
-  for (const rawLine of String(rawText || "").split(/\r?\n/)) {
-    const line = normalizeText(rawLine);
-    const match = line.match(/^\[?\s*(\d+)\s*\]?\s*[:：.)\-]\s*(.+)$/);
-    if (!match) {
-      continue;
-    }
-
-    numberedLines.push({
-      claimedIndex: Number(match[1]) - 1,
-      content: match[2],
-    });
-  }
-
-  // Trust the model's own numbering first.
-  const byClaimedIndex = new Map();
-  for (const { claimedIndex, content } of numberedLines) {
-    if (
-      claimedIndex >= 0 &&
-      claimedIndex < blanks.length &&
-      !byClaimedIndex.has(claimedIndex)
-    ) {
-      byClaimedIndex.set(claimedIndex, content);
-    }
-  }
-  const claimedAnswers = buildMultiBlankAnswersFromMap(byClaimedIndex, blanks, markedText);
-  const claimedValidCount = claimedAnswers.filter((answer) => answer.valid).length;
-
-  if (claimedValidCount >= blanks.length) {
-    return claimedAnswers;
-  }
-
-  // The model sometimes skips or miscounts a number (e.g. starts at "2:"
-  // instead of "1:"), which silently shifts every answer onto the wrong
-  // blank instead of just failing loudly. As a fallback, also try trusting
-  // plain appearance order over the model's own (possibly wrong) numbers.
-  const byPosition = new Map();
-  numberedLines.forEach((entry, position) => {
-    if (position < blanks.length) {
-      byPosition.set(position, entry.content);
-    }
-  });
-  const positionalAnswers = buildMultiBlankAnswersFromMap(byPosition, blanks, markedText);
-  const positionalValidCount = positionalAnswers.filter((answer) => answer.valid).length;
-
-  if (positionalValidCount > claimedValidCount) {
-    return positionalAnswers;
-  }
-
-  // Format-validity alone can't tell "0.1 is I's value" from "0.1 is I1's
-  // value" — a shifted numbering scheme looks equally valid either way, so
-  // validCount alone ties. If the model's own numbers are monotonically
-  // increasing in appearance order but don't start at 1, that's the
-  // signature of a consistent off-by-N shift (e.g. it skipped "1:" and
-  // began at "2:"), and appearance order is the more trustworthy mapping.
-  const isMonotonic = numberedLines.every(
-    (entry, i) => i === 0 || entry.claimedIndex > numberedLines[i - 1].claimedIndex
+  return buildMultiBlankAnswersFromMap(
+    parseNumberedAnswerMap(rawText, blanks.length), blanks, markedText
   );
-  const looksShifted =
-    isMonotonic && numberedLines.length > 0 && numberedLines[0].claimedIndex !== 0;
-
-  if (looksShifted && positionalValidCount === claimedValidCount) {
-    return positionalAnswers;
-  }
-
-  return claimedAnswers;
 }
 
 async function callMultiBlankChat(
