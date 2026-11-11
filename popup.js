@@ -3,6 +3,7 @@ const DEFAULT_SETTINGS = {
   pausedUntil: 0,
   detailedMode: false,
   showStatusWidget: true,
+  showHintPanels: true,
   materialMode: false,
   freeApiMode: false,
   openaiModelMode: "auto",
@@ -55,6 +56,7 @@ const statusNote = document.getElementById("statusNote");
 const enabledToggle = document.getElementById("enabledToggle");
 const detailedToggle = document.getElementById("detailedToggle");
 const statusWidgetToggle = document.getElementById("statusWidgetToggle");
+const hintPanelsToggle = document.getElementById("hintPanelsToggle");
 const materialModeToggle = document.getElementById("materialModeToggle");
 const openaiModelModeSelect = document.getElementById("openaiModelMode");
 const freeApiModeToggle = document.getElementById("freeApiModeToggle");
@@ -137,6 +139,7 @@ function normalizeSettings(raw = {}) {
     pausedUntil,
     detailedMode: Boolean(raw.detailedMode),
     showStatusWidget: raw.showStatusWidget !== false,
+    showHintPanels: raw.showHintPanels !== false,
     materialMode: Boolean(raw.materialMode),
     freeApiMode: Boolean(raw.freeApiMode),
     openaiModelMode: ["auto", "speed", "quality", "sol"].includes(raw.openaiModelMode) ? raw.openaiModelMode : "auto",
@@ -479,6 +482,7 @@ function render(settings) {
   enabledToggle.checked = settings.enabled;
   detailedToggle.checked = settings.detailedMode;
   statusWidgetToggle.checked = settings.showStatusWidget;
+  hintPanelsToggle.checked = settings.showHintPanels;
   materialModeToggle.checked = settings.materialMode;
   if (freeApiModeToggle) {
     freeApiModeToggle.checked = settings.freeApiMode;
@@ -536,6 +540,13 @@ enabledToggle.addEventListener("change", async () => {
 detailedToggle.addEventListener("change", async () => {
   await saveSettings({
     detailedMode: detailedToggle.checked,
+  });
+  await refresh();
+});
+
+hintPanelsToggle.addEventListener("change", async () => {
+  await saveSettings({
+    showHintPanels: hintPanelsToggle.checked,
   });
   await refresh();
 });
@@ -847,6 +858,7 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
     "pausedUntil",
     "detailedMode",
     "showStatusWidget",
+    "showHintPanels",
     "freeApiMode",
     "openaiModelMode",
     "materialMode",

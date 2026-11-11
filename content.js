@@ -35,6 +35,7 @@ const DEFAULT_SETTINGS = {
   pausedUntil: 0,
   detailedMode: false,
   showStatusWidget: true,
+  showHintPanels: true,
   materialMode: false,
   freeApiMode: false,
   openaiModelMode: "auto",
@@ -57,6 +58,7 @@ function normalizeSettings(raw = {}) {
     pausedUntil: Number(raw.pausedUntil) || 0,
     detailedMode: Boolean(raw.detailedMode),
     showStatusWidget: raw.showStatusWidget !== false,
+    showHintPanels: raw.showHintPanels !== false,
     materialMode: Boolean(raw.materialMode),
     freeApiMode: Boolean(raw.freeApiMode),
     openaiModelMode: ["auto", "speed", "quality", "sol"].includes(raw.openaiModelMode) ? raw.openaiModelMode : "auto",
@@ -109,6 +111,12 @@ function syncStatusWidgetVisibility() {
   widget.style.display = currentSettings.showStatusWidget ? "" : "none";
 }
 
+function syncHintPanelsVisibility() {
+  for (const anchor of document.querySelectorAll(".moodle-hint-anchor")) {
+    anchor.hidden = !currentSettings.showHintPanels;
+  }
+}
+
 function loadSettings(force = false) {
   if (settingsLoaded && !force) {
     return Promise.resolve(currentSettings);
@@ -119,6 +127,7 @@ function loadSettings(force = false) {
       currentSettings = normalizeSettings(items);
       settingsLoaded = true;
       syncStatusWidgetVisibility();
+      syncHintPanelsVisibility();
       resolve(currentSettings);
     });
   });
@@ -230,6 +239,10 @@ function ensureStyles() {
       display: flex;
       justify-content: flex-end;
       margin-top: 12px;
+    }
+
+    .moodle-hint-anchor[hidden] {
+      display: none !important;
     }
 
     .${HINT_PANEL_CLASS} {
@@ -1447,6 +1460,7 @@ function ensurePanel(question) {
 
   const anchor = document.createElement("div");
   anchor.className = "moodle-hint-anchor";
+  anchor.hidden = !currentSettings.showHintPanels;
 
   const isAlreadyAnswered = Boolean(question.hasExistingAnswer);
 
@@ -2336,6 +2350,8 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   currentSettings = nextSettings;
   settingsLoaded = true;
   syncStatusWidgetVisibility();
+
+  syncHintPanelsVisibility();
 
   if (detailedModeChanged || materialChanged || apiModeChanged) {
     answerCache.clear();
